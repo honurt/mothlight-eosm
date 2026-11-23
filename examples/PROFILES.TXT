@@ -1,0 +1,10 @@
+# Mothlight profiles - copy to ML/SETTINGS/PROFILES.TXT on the card.
+# name            | mode | preset   | ratio | fps    | bits
+3K Scope          | 1:1  | 3K       | 2.35  | 23.976 | 10
+2.8K Scope        | 1:1  | 2.8K     | 2.39  | 23.976 | 10
+2.5K Cinema       | 1:1  | 2.5K     | 2.35  | 23.976 | 10
+2.5K 25p          | 1:1  | 2.5K     | 2.39  | 25     | 12
+5.2K Anamorphic   | 1x3  | highest  | 2.39  | 23.976 | 10
+1080p Full Sensor | 3x3  | 1080p    | 16:9  | 23.976 | 12
+Slow motion       | 3x3  | hfr      | 2.39  | 23.976 | 10
+Canon H.264       | off  |          |       |        |

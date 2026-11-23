@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <rect width="200" height="200" rx="44" fill="#141416"/>
+  <g fill="none" stroke="#F0EDE6" stroke-width="3.5" stroke-linecap="round">
+    <path d="M90 58 C84 40 72 30 58 28"/>
+    <path d="M110 58 C116 40 128 30 142 28"/>
+  </g>
+  <circle cx="58" cy="28" r="4" fill="#F0EDE6"/>
+  <circle cx="142" cy="28" r="4" fill="#F0EDE6"/>
+  <circle cx="100" cy="114" r="58" fill="#F58C1E"/>
+  <g stroke="#141416" stroke-width="5" stroke-linecap="round">
+    <line x1="124" y1="114" x2="146" y2="78"/>
+    <line x1="112" y1="134.8" x2="153" y2="136"/>
+    <line x1="88" y1="134.8" x2="107" y2="171"/>
+    <line x1="76" y1="114" x2="54" y2="150"/>
+    <line x1="88" y1="93.2" x2="47" y2="92"/>
+    <line x1="112" y1="93.2" x2="93" y2="57"/>
+  </g>
+  <polygon points="124,114 112,134.8 88,134.8 76,114 88,93.2 112,93.2" fill="#141416"/>
+  <circle cx="100" cy="114" r="7" fill="#FFD08A"/>
+  <circle cx="100" cy="114" r="58" fill="none" stroke="#F0EDE6" stroke-width="4"/>
+</svg>

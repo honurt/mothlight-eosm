@@ -1,0 +1,6 @@
+# Pinned Magic Lantern engines. scripts/fetch.sh checks out exactly these commits,
+# so a build is reproducible. Bump a line deliberately, rebuild, test on the camera, commit.
+#
+# name      repository                                                    branch                 commit
+cropmood    https://github.com/bilalfakhouri/magiclantern_hg_02.git       crop_rec_4k_mlv_snd    5f0cda843ffa732a1ae4811d22b11fb92c4fa158
+upstream    https://github.com/reticulatedpines/magiclantern_simplified.git dev                  142472e95054d73640f50789ac0fd66325499d82

@@ -1,0 +1,9 @@
+# engine checkouts and build output
+/work/
+/out/
+# simulator binaries
+/sim/sim
+/sim/e2e
+/sim/test_budget
+*.o
+.DS_Store

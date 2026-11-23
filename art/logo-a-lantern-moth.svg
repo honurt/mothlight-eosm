@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <defs>
+    <radialGradient id="glowA" cx="50%" cy="52%" r="50%">
+      <stop offset="0" stop-color="#FFB347" stop-opacity="0.95"/>
+      <stop offset="0.35" stop-color="#F58C1E" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#F58C1E" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="200" height="200" rx="44" fill="#141416"/>
+  <circle cx="100" cy="104" r="70" fill="url(#glowA)"/>
+  <g fill="#F0EDE6">
+    <path d="M100 98 C82 58 40 44 30 70 C22 92 58 112 100 106 Z"/>
+    <path d="M100 98 C118 58 160 44 170 70 C178 92 142 112 100 106 Z"/>
+    <path d="M100 110 C80 112 50 126 58 148 C66 166 92 142 100 118 Z" opacity="0.85"/>
+    <path d="M100 110 C120 112 150 126 142 148 C134 166 108 142 100 118 Z" opacity="0.85"/>
+  </g>
+  <circle cx="100" cy="104" r="9" fill="#F58C1E"/>
+  <rect x="96" y="80" width="8" height="58" rx="4" fill="#141416"/>
+  <rect x="97.5" y="82" width="5" height="54" rx="2.5" fill="#F0EDE6"/>
+  <g fill="none" stroke="#F0EDE6" stroke-width="3" stroke-linecap="round">
+    <path d="M98 84 C93 66 84 58 74 54"/>
+    <path d="M102 84 C107 66 116 58 126 54"/>
+  </g>
+</svg>
