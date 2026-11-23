@@ -3,7 +3,7 @@
 #   make -C sim preview    run it and render out/preview/panel.gif (needs an engine in work/ for the fonts)
 #   make -C sim test       unit tests for the budget and profile parser
 CC      ?= cc
-CFLAGS  ?= -O2 -std=gnu99 -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -g
+CFLAGS  ?= -DMOTH_SIM -O2 -std=gnu99 -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -g
 UI      = ../modules/moth_ui
 SRC     = $(UI)/themes.c $(UI)/panel.c $(UI)/ui_gfx.c $(UI)/ui_text.c $(UI)/budget.c $(UI)/profiles.c
 FONTS  ?= $(firstword $(wildcard ../work/cropmood/data/fonts ../work/upstream/data/fonts))

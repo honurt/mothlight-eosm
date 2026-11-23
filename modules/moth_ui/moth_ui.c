@@ -592,6 +592,13 @@ static unsigned int moth_keypress_cbr(unsigned int key)
 
     int trigger = cfg_key == 1 && key == MODULE_KEY_INFO;
     if (trigger && (opening || open_request)) return 0;     /* already on its way */
+    if (trigger && lv && !is_movie_mode() && !gui_menu_shown())
+    {
+        /* INFO stays Canon's in photo mode; say once per session why the panel did not come */
+        static int hinted;
+        if (!hinted) { hinted = 1; NotifyBox(2000, "Mothlight works in movie mode"); }
+        return 1;
+    }
     if (trigger && can_show_panel())
     {
         key_head = key_tail = 0;

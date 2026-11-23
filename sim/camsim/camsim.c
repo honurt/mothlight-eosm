@@ -758,6 +758,10 @@ static void s_info_in_photo_mode(void)
     tap(K_INFO, 0); run_for(400);
     EXPECT(!overlay_active, "panel opened in photo mode");
     EXPECT(canon_got[K_INFO] == before + 1, "INFO in photo mode did not reach Canon");
+    EXPECT(notify_count == 1 && strstr(notify_last, "movie mode"), "no hint in photo mode: \"%s\"", notify_last);
+    tap(K_INFO, 0); run_for(300);
+    EXPECT(notify_count == 1, "the photo-mode hint repeats on every INFO");
+    EXPECT(canon_got[K_INFO] == before + 2, "second INFO in photo mode did not reach Canon");
     finish();
 }
 
@@ -816,10 +820,11 @@ static void s_profiles_variants(void)
             boot();
             EXPECT(profile_count > 0 && profile_count <= MAX_PROFILES, "case %d: %d profiles", c, profile_count);
             open_panel();
+            int s0 = panel.sel;
             for (int i = 0; i < profile_count + 3; i++) { tap(K_DOWN, 20); run_for(60); }
-            EXPECT(panel.sel == profile_count - 1, "case %d: DOWN past the end: sel %d of %d", c, panel.sel, profile_count);
+            EXPECT(panel.sel == (s0 + profile_count + 3) % profile_count, "case %d: DOWN past the end should wrap: sel %d of %d", c, panel.sel, profile_count);
             for (int i = 0; i < profile_count + 3; i++) { tap(K_UP, 20); run_for(60); }
-            EXPECT(panel.sel == 0, "case %d: UP past the top: sel %d", c, panel.sel);
+            EXPECT(panel.sel == s0, "case %d: UP past the top should wrap back: sel %d", c, panel.sel);
             run_for(400);
             finish();
             _exit(failures ? 1 : 0);
@@ -955,6 +960,57 @@ static void s_soak(void)
     finish();
 }
 
+static void check_text_fits(const char * what)
+{
+    run_for(1500);                          /* every animation done */
+    panel.full_redraw = 1;
+    ui_text_overflows = 0;
+    run_for(60);
+    EXPECT(ui_text_overflows == 0, "%s (theme %s, profile \"%s\"): text does not fit: %s", what,
+           moth_themes[cfg_theme].name, profiles[panel.sel].name, ui_text_overflow_last);
+}
+
+static void s_text_fits(void)
+{
+    static const char * longnames =
+        "Twenty three characters | 1:1 | 3K | 2.39 | 23.976 | 10\n"
+        "WWWWWWWWWWWWWWWWWWWWWWW | 1x3 | highest | 2.39 | 23.976 | 12\n"
+        "Slow 3x3 long name here | 3x3 | hfr | 16:9 | 25 | 14\n"
+        "H264 with a long name x | off | | | |\n";
+    for (int variant = 0; variant < 2; variant++)
+    {
+        pid_t pid = fork();
+        if (pid == 0)
+        {
+            profiles_txt = variant ? longnames : 0;
+            boot();
+            open_panel();
+            for (int t = 0; t < THEME_COUNT; t++)
+            {
+                for (int i = 0; i < profile_count; i++)
+                {
+                    check_text_fits("browsing");
+                    tap(K_DOWN, 20);
+                }
+                tap(K_RIGHT, 20);
+            }
+            /* the applying line and the result with the longest name, as the active profile */
+            select_profile(variant ? 1 : 0);
+            tap(K_SET, 20); run_for(30);
+            ui_text_overflows = 0; panel.full_redraw = 1; run_for(40);
+            EXPECT(ui_text_overflows == 0, "applying line: %s", ui_text_overflow_last);
+            run_for(1000);
+            tap(K_DOWN, 20);
+            check_text_fits("after applying (In use: ...)");
+            finish();
+            fflush(stdout);
+            _exit(failures ? 1 : 0);
+        }
+        int st; waitpid(pid, &st, 0);
+        if (!WIFEXITED(st) || WEXITSTATUS(st)) { failures++; fprintf(stderr, "  FAIL [%s] variant %d\n", scenario, variant); }
+    }
+}
+
 /* ---------------------------------------------------------------- runner */
 
 struct sc { const char * name; void (*fn)(void); };
@@ -986,6 +1042,7 @@ static const struct sc all[] = {
     { "corrupt config values at boot", s_bad_config_at_boot },
     { "animations off", s_reduced_motion },
     { "learning compression from a clip", s_learning },
+    { "every profile x every theme: all text fits (23-char names too)", s_text_fits },
     { "soak: 4000 random steps of keys and camera events", s_soak },
 };
 

@@ -199,12 +199,15 @@ static void render_bar(struct panel * p, const struct panel_view * v, struct can
     ui_text(c, UF_MED, x, 21, TH->head_style == HEAD_BAR ? UC_WHITE : TH->title, UA_LEFT, "Rec profiles");
 
     char buf[80], card[24] = "", bat[24] = "";
-    snprintf(buf, sizeof(buf), "%s  v%s", v->engine ? v->engine : "", v->version ? v->version : "");
-    ui_text(c, UF_SMALL, SW - 16, 9, bar_dim(v), UA_RIGHT, buf);
-    if (v->free_MB >= 0) snprintf(card, sizeof(card), "%d.%d GB", v->free_MB / 1024, v->free_MB % 1024 * 10 / 1024);
+    if (v->active >= 0 && v->active < v->count)
+        snprintf(buf, sizeof(buf), "In use: %s", v->profiles[v->active].name);
+    else
+        snprintf(buf, sizeof(buf), "No profile applied yet");
+    ui_text_fit(c, UF_SMALL, SW - 16, 9, bar_text(v), UA_RIGHT, buf, SW - 16 - 240);
+    if (v->free_MB >= 0) snprintf(card, sizeof(card), "   %d.%d GB free", v->free_MB / 1024, v->free_MB % 1024 * 10 / 1024);
     if (v->battery >= 0) snprintf(bat, sizeof(bat), "   BAT %d%%", v->battery);
-    snprintf(buf, sizeof(buf), "SD %d MB/s%s   %s%s", v->card_kBps / 1000, v->card_auto ? "*" : "", card, bat);
-    ui_text(c, UF_SMALL, SW - 16, 27, bar_text(v), UA_RIGHT, buf);
+    snprintf(buf, sizeof(buf), "SD %s%d MB/s%s%s", v->card_auto ? "~" : "", v->card_kBps / 1000, card, bat);
+    ui_text(c, UF_SMALL, SW - 16, 27, bar_dim(v), UA_RIGHT, buf);
 
     /* a thin accent line sweeps across when the panel opens */
     if (TH->head_style == HEAD_TABS) { gfx_fill(c, 0, BAR_H - 2, SW, 2, UC_RED); return; }
@@ -269,18 +272,26 @@ static void render_list(struct panel * p, const struct panel_view * v, struct ca
         uint8_t sum_col  = on_hl ? TH->hl_text : C_DIM;
         int right = LIST_W - 22 - sb;
 
-        if (i == v->active) gfx_dot(c, 25, y + 19, 4, on_hl && TH->hl_style == HL_FILL ? TH->hl_text : TH->active);
-        ui_text(c, UF_MED, 36, y + 6, name_col, UA_LEFT, pr->name);
-        ui_text(c, UF_SMALL, 37, y + 34, sum_col, UA_LEFT, profile_summary(pr, buf, sizeof(buf)));
+        if (i == v->active) gfx_dot(c, 24, y + 19, 5, on_hl && TH->hl_style == HL_FILL ? TH->hl_text : TH->active);
+        ui_text_fit(c, UF_SMALL, 37, y + 34, sum_col, UA_LEFT, profile_summary(pr, buf, sizeof(buf)), right - 37);
 
-        if (is_h264(pr)) continue;
-        int need = need_kBps(v, pr);
-        enum budget_verdict vd = budget_verdict(need, v->card_kBps);
-        uint8_t col = verdict_color(v, vd);
-        int fill = budget_ratio_q8(need, v->card_kBps) / 2;
-        fill = (fill > 256 ? 256 : fill) * cascade_q8(p, v, i - first, now) >> 8;
-        gfx_dot(c, right - 4, y + 18, 5, on_hl && TH->hl_style == HL_FILL ? TH->hl_text : col);
-        gfx_bar(c, right - 44, y + 10, 32, 5, fill, 128, C_TRACK, col, TH->burst, 0);
+        /* the verdict as a word, readable at arm's length and without colour vision;
+           the labels appear one row after another as the panel opens */
+        const char * word;
+        uint8_t fill, ink;
+        if (is_h264(pr)) { word = "H.264"; fill = C_TRACK; ink = C_DIM; }
+        else
+        {
+            enum budget_verdict vd = budget_verdict(need_kBps(v, pr), v->card_kBps);
+            word = vd == BUDGET_CONTINUOUS ? "OK" : vd == BUDGET_MARGINAL ? "EDGE" : "BURST";
+            fill = verdict_color(v, vd);
+            ink = vd == BUDGET_BURST ? UC_WHITE : UC_BLACK;
+        }
+        int lw = ui_text_w(UF_SMALL, word) + 12;
+        ui_text_fit(c, UF_MED, 36, y + 6, name_col, UA_LEFT, pr->name, right - lw - 8 - 36);
+        if (cascade_q8(p, v, i - first, now) < 160) continue;
+        gfx_round(c, right - lw, y + 9, lw, 18, 9, fill);
+        ui_text(c, UF_SMALL, right - lw + 6, y + 12, ink, UA_LEFT, word);
     }
 
     if (sb)
@@ -322,7 +333,7 @@ static void render_detail(struct panel * p, const struct panel_view * v, struct 
     int x = DX0 + DPAD + tween_value(&p->slide, now);
     char buf[96];
 
-    ui_text(c, UF_MED, x, BAR_H + 12, C_DIM, UA_LEFT, pr->name);
+    ui_text_fit(c, UF_MED, x, BAR_H + 12, C_DIM, UA_LEFT, pr->name, SW - DPAD - x);
     if (is_h264(pr))
     {
         ui_text(c, UF_LARGE, x, BAR_H + 40, C_TEXT, UA_LEFT, "1920 x 1080");
@@ -330,8 +341,10 @@ static void render_detail(struct panel * p, const struct panel_view * v, struct 
         cx += chip(v, c, cx, BAR_H + 86, "H.264");
         cx += chip(v, c, cx, BAR_H + 86, "with sound");
         chip(v, c, cx, BAR_H + 86, "RAW off");
-        ui_text(c, UF_SMALL, x, BAR_H + 130, C_DIM, UA_LEFT, "Canon's own recording: full sensor width, small files,");
-        ui_text(c, UF_SMALL, x, BAR_H + 146, C_DIM, UA_LEFT, "no card speed worries. Good for long takes and proxies.");
+        static const char * about[] = { "Canon's own recording:", "full sensor width, small",
+                                        "files, no card speed worries.", "Good for long takes and proxies." };
+        for (int i = 0; i < 4; i++)
+            ui_text_fit(c, UF_MONO, x, BAR_H + 134 + i * 26, C_DIM, UA_LEFT, about[i], SW - DPAD - x);
         return;
     }
 
@@ -395,15 +408,21 @@ static void render_detail(struct panel * p, const struct panel_view * v, struct 
     ui_text(c, UF_MED, SW - DPAD, gy, verdict_color(v, vd), UA_RIGHT, verdict_word(vd, 1));
     int gw = SW - DPAD - (DX0 + DPAD);
     gfx_bar(c, DX0 + DPAD, gy + 32, gw, 10, tween_value(&p->bar, now), 128, C_TRACK, verdict_color(v, vd), TH->burst, C_DIM);
-    snprintf(buf, sizeof(buf), "card %d MB/s%s", v->card_kBps / 1000, v->card_auto ? " (est. from SD clock)" : "");
-    ui_text(c, UF_SMALL, x, gy + 52, C_DIM, UA_LEFT, buf);
+    snprintf(buf, sizeof(buf), "Card %s%d MB/s%s", v->card_auto ? "~" : "", v->card_kBps / 1000,
+             v->card_auto ? " (est.)" : "");
+    ui_text(c, UF_MONO, x, gy + 50, C_DIM, UA_LEFT, buf);
 
     int mins = budget_minutes_on_card(need, v->free_MB);
     int bpp = budget_bpp_x100(f, v->bpp);
     int learned = (v->bpp_learned_mask >> (f->bits - 10)) & 1;
-    if (mins >= 0) snprintf(buf, sizeof(buf), "~%d min fit on the card   %d.%02d bit/px %s", mins, bpp / 100, bpp % 100, learned ? "(learned)" : "(typical)");
-    else           snprintf(buf, sizeof(buf), "%d.%02d bit/px %s", bpp / 100, bpp % 100, learned ? "(learned)" : "(typical)");
-    ui_text(c, UF_SMALL, x, gy + 70, C_DIM, UA_LEFT, buf);
+    if (mins >= 0) snprintf(buf, sizeof(buf), "~%d min on the card", mins);
+    else           buf[0] = 0;
+    int mw = buf[0] ? ui_text(c, UF_MONO, x, gy + 74, C_DIM, UA_LEFT, buf) : 0;
+    /* the compression the estimate assumes ("learned" once a clip of this depth was
+       measured), right-aligned on the same line, only where it cannot touch the text */
+    snprintf(buf, sizeof(buf), "%d.%02d bit/px %s", bpp / 100, bpp % 100, learned ? "learned" : "typical");
+    if (x + mw + 16 <= SW - DPAD - ui_text_w(UF_SMALL, buf))
+        ui_text(c, UF_SMALL, SW - DPAD, gy + 80, learned ? C_DIM : C_FAINT, UA_RIGHT, buf);
 }
 
 static int detail_animating(const struct panel * p, uint32_t now)
@@ -439,14 +458,14 @@ static void render_hint(struct panel * p, const struct panel_view * v, struct ca
         char buf[64];
         spinner(c, v, 30, cy, now);
         snprintf(buf, sizeof(buf), "Applying %s ...", v->profiles[p->applying].name);
-        ui_text(c, UF_MED, 52, cy - 11, bar_text(v), UA_LEFT, buf);
+        ui_text_fit(c, UF_MED, 52, cy - 11, bar_text(v), UA_LEFT, buf, SW - 52 - 16);
         return;
     }
     if (p->state == PS_DONE)
     {
         int e = ease_back_q8(anim_t_q8(now, p->t_state, dur(v, 260)));
         gfx_dot(c, 30, cy, 2 + 8 * e / 256, p->toast_ok ? TH->ok : TH->burst);
-        ui_text(c, UF_MED, 52, cy - 11, p->toast_ok ? bar_text(v) : TH->burst, UA_LEFT, p->toast);
+        ui_text_fit(c, UF_MED, 52, cy - 11, p->toast_ok ? bar_text(v) : TH->burst, UA_LEFT, p->toast, SW - 52 - 16);
         return;
     }
 
@@ -455,7 +474,7 @@ static void render_hint(struct panel * p, const struct panel_view * v, struct ca
     x += keycap(v, c, x, y, "SET", -1) + 6;   x += ui_text(c, UF_SMALL, x, y + 5, fg, UA_LEFT, "Apply") + 22;
     x += keycap(v, c, x, y, "", 10) + 6;      x += ui_text(c, UF_SMALL, x, y + 5, fg, UA_LEFT, "Choose") + 22;
     x += keycap(v, c, x, y, "", 11) + 6;      x += ui_text(c, UF_SMALL, x, y + 5, fg, UA_LEFT, "Theme") + 22;
-    x += keycap(v, c, x, y, "MENU", -1) + 6;  ui_text(c, UF_SMALL, x, y + 5, fg, UA_LEFT, "Close");
+    x += keycap(v, c, x, y, "INFO", -1) + 6;  ui_text(c, UF_SMALL, x, y + 5, fg, UA_LEFT, "Close");
 
     char buf[32];
     snprintf(buf, sizeof(buf), "%s theme", TH->name);
@@ -561,8 +580,9 @@ int panel_key(struct panel * p, const struct panel_view * v, int key, uint32_t n
         case PS_OPEN:
             switch (key)
             {
-                case PK_UP:    select_row(p, v, p->sel - 1, now); break;
-                case PK_DOWN:  select_row(p, v, p->sel + 1, now); break;
+                /* the list wraps at both ends, like Canon's menus with the rear dial */
+                case PK_UP:    if (v->count > 0) select_row(p, v, (p->sel - 1 + v->count) % v->count, now); break;
+                case PK_DOWN:  if (v->count > 0) select_row(p, v, (p->sel + 1) % v->count, now); break;
                 case PK_LEFT:  return PA_THEME_PREV;
                 case PK_RIGHT: return PA_THEME_NEXT;
                 case PK_SET:

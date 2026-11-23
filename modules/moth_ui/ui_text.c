@@ -1,3 +1,5 @@
+#include <string.h>
+#include <stdio.h>
 #include "ui_text.h"
 
 static const struct ui_rbf * fonts[UF_COUNT];
@@ -29,6 +31,12 @@ int ui_text_w(int font, const char * s)
     return w;
 }
 
+#ifdef MOTH_SIM
+/* simulator builds count text that does not fit its area (the tests fail on it) */
+int ui_text_overflows;
+char ui_text_overflow_last[96];
+#endif
+
 int ui_text(struct canvas * c, int font, int x, int y, uint8_t fg, int align, const char * s)
 {
     const struct ui_rbf * f = get(font);
@@ -40,6 +48,13 @@ int ui_text(struct canvas * c, int font, int x, int y, uint8_t fg, int align, co
     /* rows of this string that survive clipping */
     int r0 = c->cy0 - y; if (r0 < 0) r0 = 0;
     int r1 = c->cy1 - y; if (r1 > f->height) r1 = f->height;
+#ifdef MOTH_SIM
+    if (r1 > r0 && (x < c->cx0 || x + w > c->cx1))
+    {
+        ui_text_overflows++;
+        snprintf(ui_text_overflow_last, sizeof(ui_text_overflow_last), "\"%s\" x %d..%d, area %d..%d", s, x, x + w, c->cx0, c->cx1);
+    }
+#endif
     if (r1 <= r0 || x >= c->cx1 || x + w <= c->cx0) return w;
 
     int stride = f->width / 8;          /* bytes per glyph row */
@@ -63,4 +78,21 @@ int ui_text(struct canvas * c, int font, int x, int y, uint8_t fg, int align, co
         x += cw;
     }
     return w;
+}
+
+/* like ui_text, but never wider than max_w: shortens s and ends it with "..." */
+int ui_text_fit(struct canvas * c, int font, int x, int y, uint8_t fg, int align, const char * s, int max_w)
+{
+    if (ui_text_w(font, s) <= max_w) return ui_text(c, font, x, y, fg, align, s);
+    char buf[96];
+    int n = snprintf(buf, sizeof(buf), "%s", s);
+    if (n > (int)sizeof(buf) - 4) n = sizeof(buf) - 4;
+    while (n > 0)
+    {
+        n--;
+        while (n > 0 && buf[n - 1] == ' ') n--;     /* no "word ..." */
+        memcpy(buf + n, "...", 4);
+        if (ui_text_w(font, buf) <= max_w) break;
+    }
+    return ui_text(c, font, x, y, fg, align, buf);
 }

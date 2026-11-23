@@ -1,6 +1,28 @@
 # Changelog
 
-## 0.1.0 (unreleased, waiting for its first camera test)
+## 0.1.1 (first camera test, 23 Nov 2026)
+
+Found on the camera:
+- the panel closed on every D-pad press (the EOS M's release codes reach modules as key 0)
+- the top and bottom bars went black when navigating, with a black flash (Canon redrew on the releases)
+
+Found by `sim/camsim`, the new harness that runs the real camera code against a fake EOS M:
+- REC and PLAY were swallowed while the panel was open
+- applying a profile could close the panel when Crop Mood restarted LiveView
+- a profile could be half applied when crop_rec was not loaded
+- the 2 s safety watchdog left ML's overlays off and leaked 338 KB
+- a second INFO during start-up made the panel reopen by itself after the next close
+- the panel stayed up after switching to photo mode or the display turning off
+- long profile names ran under the verdict; the H.264 description ran off the screen
+
+Easier to use:
+- each profile says OK / EDGE / BURST in words, not only by colour
+- the header shows the profile in use and the card; the record-time lines are larger
+- the list wraps at both ends; INFO closes (it is what opens the panel)
+- after a result, UP/DOWN keep browsing instead of closing the panel
+- INFO in photo mode says once that Mothlight works in movie mode
+
+## 0.1.0
 
 - Crop Mood engine (Bilal Fakhouri, `crop_rec_4k_mlv_snd` @ 5f0cda84) pinned and building with GCC 13 / Python 3.
 - Upstream engine (`magiclantern_simplified` dev @ 142472e9) as an alternative build.
