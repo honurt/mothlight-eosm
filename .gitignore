@@ -9,3 +9,5 @@
 .DS_Store
 sim/test_keys
 sim/module_keys.h
+sim/camsim/camsim
+sim/camsim/fake/module_keys.h

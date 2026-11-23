@@ -14,7 +14,7 @@ static int run(const int * keys, int n, int * nav, int * nav_n)
     for (int i = 0; i < n; i++)
     {
         struct key_route r = moth_route_key(keys[i]);
-        if (r.panel_key == PK_CLOSE) closes++;
+        if (r.panel_key == PK_CLOSE || r.panel_key == PK_CLOSE_NOW) closes++;
         else if (r.panel_key != PK_NONE) nav[(*nav_n)++] = r.panel_key;
     }
     return closes;
@@ -42,6 +42,10 @@ int main(void)
         CHECK(run(&closers[i], 1, nav, &nn) == 1, "INFO/MENU/PLAY/REC/half-shutter close");
 
     CHECK(moth_route_key(MODULE_KEY_PRESS_HALFSHUTTER).pass_to_canon == 1, "half-shutter still focuses");
+    CHECK(moth_route_key(MODULE_KEY_REC).pass_to_canon == 1, "REC still starts recording");
+    CHECK(moth_route_key(MODULE_KEY_PLAY).pass_to_canon == 1, "PLAY still opens playback");
+    CHECK(moth_route_key(MODULE_KEY_REC).panel_key == PK_CLOSE_NOW, "REC closes without animating over the REC screen");
+    CHECK(moth_route_key(MODULE_KEY_INFO).pass_to_canon == 0, "INFO only closes the panel");
     CHECK(moth_route_key(MODULE_KEY_PRESS_DOWN).pass_to_canon == 0, "nav keys are swallowed");
     CHECK(moth_route_key(0).pass_to_canon == 1, "untranslated events go on to Canon");
 

@@ -89,6 +89,14 @@ int  panel_frame(struct panel * p, const struct panel_view * v, struct canvas * 
 
 static inline int panel_is_open(const struct panel * p) { return p->state != PS_CLOSED; }
 
+/* fully on screen: the iris has finished opening and is not closing. Only then does the
+   back buffer equal what must be on the screen (used to repair foreign redraws) */
+static inline int panel_settled(const struct panel * p)
+{
+    return (p->state == PS_OPEN || p->state == PS_APPLYING || p->state == PS_DONE)
+           && p->prev_y0 <= 0 && p->prev_y1 >= 480;
+}
+
 void panel_theme_changed(struct panel * p);  /* redraw everything in the new look */
 
 /* geometry: the panel is the whole 720 x 480 screen of the EOS M */

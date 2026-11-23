@@ -32,6 +32,7 @@ test_keys: ../tests/test_keys.c $(UI)/keymap.h $(UI)/panel.h module_keys.h
 test: test_budget test_keys
 	./test_budget
 	./test_keys
+	$(MAKE) -C camsim test
 
 preview: sim
 	@test -n "$(FONTS)" || { echo "no fonts: run scripts/fetch.sh first"; exit 1; }

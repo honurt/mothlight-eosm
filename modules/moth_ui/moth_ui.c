@@ -80,9 +80,12 @@ static struct canvas back;
 static volatile int key_ring[8];
 static volatile int key_head, key_tail;
 static volatile int open_request;
+static volatile int opening;                /* overlay_begin() in progress (the GUI task must not re-request) */
 
 static int overlay_active;
 static volatile uint32_t last_frame_ms;     /* watchdog: the key handler gives keys back if this stops moving */
+static volatile int keys_released;          /* watchdog tripped: keys go to Canon until the task cleans up */
+static uint32_t lv_lost_at;                 /* LiveView went away (Crop Mood restarts it while applying) */
 static int saved_global_draw = -1;
 
 static int apply_phase;                     /* 0 idle, 1 settings sent, 2 waiting for LiveView */
@@ -236,9 +239,12 @@ static const char * apply_start(const struct rec_profile * p)
         return 0;
     }
 
+    /* check first, change after: never leave a profile half applied */
     static const char * preset_entry[] = { "", "Preset:", "Preset: ", "Preset:  " };
-    if (!set_menu("Movie", "RAW video", 1))   return "Load mlv_lite in the Modules tab";
-    if (!set_menu("Movie", "Crop mood", p->mood)) return "Load crop_rec in the Modules tab";
+    if (menu_get_value_from_script("Movie", "RAW video") == INT_MIN) return "Load mlv_lite in the Modules tab";
+    if (menu_get_value_from_script("Movie", "Crop mood") == INT_MIN) return "Load crop_rec in the Modules tab";
+    set_menu("Movie", "RAW video", 1);
+    set_menu("Movie", "Crop mood", p->mood);
     set_menu("RAW video", "Data format", 3);            /* lossless; Crop Mood picks the depth */
     set_menu("Crop mood", preset_entry[(int)p->mood], p->preset);
     set_menu("Crop mood", "Aspect ratio:", p->ratio);
@@ -346,6 +352,9 @@ static int overlay_begin(void)
     canon_gui_disable_front_buffer();
     msleep(50);
     clrscr();
+    key_head = key_tail = 0;                /* nothing from a previous session */
+    keys_released = 0;
+    lv_lost_at = 0;
     last_frame_ms = get_ms_clock();
     overlay_active = 1;
     return 1;
@@ -354,8 +363,13 @@ static int overlay_begin(void)
 static void overlay_end(void)
 {
     overlay_active = 0;
+    panel.state = PS_CLOSED;
+    apply_phase = 0;                        /* an apply cut short is not resumed on the next open */
+    keys_released = 0;
     if (saved_global_draw > 0) menu_set_value_from_script("Overlay", "Global Draw", saved_global_draw);
     saved_global_draw = -1;
+    /* an instant close leaves the panel's pixels behind; ML's menu repaints itself */
+    if (!gui_menu_shown()) clrscr();
     canon_gui_enable_front_buffer(1);
     free(back_buf);
     back_buf = 0;
@@ -484,12 +498,23 @@ static void moth_task(void)
 
         if (open_request && !overlay_active)
         {
+            opening = 1;
             open_request = 0;
             if (can_show_panel() && overlay_begin())
             {
                 fill_view();
-                panel_open(&panel, &view, now);
+                panel_open(&panel, &view, get_ms_clock());
             }
+            open_request = 0;               /* an INFO that arrived while starting up is not a new request */
+            opening = 0;
+            continue;
+        }
+
+        if (overlay_active && keys_released)
+        {
+            /* the watchdog gave the buttons back while we were stuck: tidy up quietly */
+            overlay_end();
+            continue;
         }
 
         if (overlay_active)
@@ -497,6 +522,7 @@ static void moth_task(void)
             int k;
             while ((k = pop_key()) != PK_NONE)
             {
+                if (k == PK_CLOSE_NOW) { overlay_end(); break; }
                 int act = panel_key(&panel, &view, k, now);
                 if (act == PA_APPLY) apply_phase = 1;
                 if (act == PA_THEME_NEXT || act == PA_THEME_PREV)
@@ -506,18 +532,27 @@ static void moth_task(void)
                     panel_theme_changed(&panel);
                 }
             }
+            if (!overlay_active) continue;
             if (apply_phase) apply_poll(now);
 
-            /* something took the screen from us (menu, playback, recording): close at once */
-            if (!lv || gui_menu_shown() || RECORDING) panel.state = PS_CLOSING, panel.reveal.dur = 0;
+            /* Something took the screen (ML menu, recording, photo mode, display off): give it
+               back at once, without drawing again. LiveView itself may blink off while Crop Mood
+               reconfigures, so only its long absence counts (longer while applying). */
+            int taken = gui_menu_shown() || RECORDING || !is_movie_mode() || !display_is_on();
+            if (!lv)
+            {
+                if (!lv_lost_at) lv_lost_at = now ? now : 1;
+                if (now - lv_lost_at > (apply_phase ? 6000u : 700u)) taken = 1;
+            }
+            else lv_lost_at = 0;
+            if (taken) { overlay_end(); continue; }
 
             struct present out;
             last_frame_ms = now;
             view.active = cfg_active;
             int fl = panel_frame(&panel, &view, &back, now, &out);
             if (fl & PF_PRESENTED) present(&out);
-            if ((panel.state == PS_OPEN || panel.state == PS_APPLYING || panel.state == PS_DONE)
-                && screen_was_disturbed())
+            if (panel_settled(&panel) && screen_was_disturbed())
                 present_full();
             if (fl & PF_CLOSED) overlay_end();
             msleep((fl & PF_ANIMATING) ? 20 : 50);
@@ -540,11 +575,12 @@ static void moth_task(void)
 
 static unsigned int moth_keypress_cbr(unsigned int key)
 {
-    if (overlay_active && get_ms_clock() - last_frame_ms > 2000)
+    if (overlay_active && (keys_released || get_ms_clock() - last_frame_ms > 2000))
     {
-        /* the panel task stopped drawing: never hold the camera's buttons hostage */
-        overlay_active = 0;
-        canon_gui_enable_front_buffer(1);
+        /* The panel task stopped drawing: never hold the camera's buttons hostage. Only flag
+           it here (this is the GUI task); the panel task frees and restores when it wakes. */
+        if (!keys_released) canon_gui_enable_front_buffer(1);
+        keys_released = 1;
         return 1;
     }
     if (overlay_active)
@@ -555,6 +591,7 @@ static unsigned int moth_keypress_cbr(unsigned int key)
     }
 
     int trigger = cfg_key == 1 && key == MODULE_KEY_INFO;
+    if (trigger && (opening || open_request)) return 0;     /* already on its way */
     if (trigger && can_show_panel())
     {
         key_head = key_tail = 0;
@@ -574,7 +611,7 @@ static unsigned int moth_keypress_cbr(unsigned int key)
 
 static unsigned int moth_keypress_raw_cbr(unsigned int raw)
 {
-    if (!overlay_active) return 1;
+    if (!overlay_active || keys_released) return 1;
     const struct event * e = (const struct event *) raw;
     if (e && e->type == 0)
         switch (e->param)

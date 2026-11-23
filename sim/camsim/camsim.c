@@ -1,0 +1,1020 @@
+/*
+ * camsim: runs the real modules/moth_ui/moth_ui.c against a fake EOS M.
+ *
+ * The panel simulator (sim/e2e.c) drives panel.c directly and so never saw the camera
+ * glue -- which is where both bugs found on the camera were. This harness compiles
+ * moth_ui.c itself and models the parts of the camera it talks to, pessimistically:
+ *
+ *   - buttons reach the module the way ML's module.c delivers them: portable key to
+ *     CBR_KEYPRESS (0 when ML has no name for it), then the raw event to CBR_KEYPRESS_RAW,
+ *     and only if both pass does Canon get it
+ *   - Canon redraws its LiveView screen over the BMP layer on every button it receives,
+ *     whether or not the front buffer is "disabled" (what the camera actually did)
+ *   - applying a profile pauses LiveView and set_lv_zoom blocks, like Crop Mood does
+ *   - the module's task and the GUI task alternate deterministically (pthread hand-off),
+ *     the task's msleep() is where time passes
+ *
+ * After every frame the task draws, invariants are checked (screen == panel when settled,
+ * no Canon redraw caused by navigation, resources restored after close, no leaks ...).
+ * Each scenario runs in its own process so moth_ui.c's statics start fresh.
+ *
+ *   camsim [fonts dir] [frames dir]     runs every scenario; frames dir: dump PPMs
+ */
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include "fake/fake_ml.h"
+
+/* ---------------------------------------------------------------- the module under test */
+#include "../../modules/moth_ui/moth_ui.c"
+#undef malloc
+#undef free
+
+/* ---------------------------------------------------------------- world */
+
+struct cam_state cam;
+static uint32_t now_ms;
+static uint8_t * bmp;                       /* 960 x 480, like the EOS M's BMP VRAM */
+struct font font_dynamic[UF_COUNT];
+
+static const char * scenario = "?";
+static int failures;
+#define FAIL(...) do { fprintf(stderr, "  FAIL [%s @%ums] ", scenario, now_ms); \
+                       fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); failures++; } while (0)
+#define EXPECT(c, ...) do { if (!(c)) FAIL(__VA_ARGS__); } while (0)
+
+/* counters the scenarios look at */
+static int canon_got[256];                  /* Canon button codes received */
+static int canon_redraws, canon_redraws_open;
+static long heap_live, heap_peak;
+static int fail_big_malloc;                 /* fail the next allocation >= 100 kB */
+static int notify_count;
+static char notify_last[96];
+static int stall_zoom_ms;                   /* set_lv_zoom blocks this long */
+static int lv_pause_ms = 350;               /* LiveView off while Crop Mood reconfigures */
+static int canon_periodic_ms;               /* Canon refreshes its screen on its own */
+static int frames_checked, settled_mismatch;
+static const char * dump_dir;
+static int dump_n;
+static int global_draw_at_start = 1;
+static int begin_pending;                  /* overlay_begin() is between its first call and overlay_active = 1 */
+
+/* menus: (menu, entry) -> value; missing entries model unloaded modules */
+struct mval { const char * menu, * entry; int value; int exists; };
+static struct mval menus[] = {
+    { "Movie", "RAW video", 0, 1 },
+    { "Movie", "Crop mood", 0, 1 },
+    { "RAW video", "Data format", 0, 1 },
+    { "RAW video", "Resolution", 0, 1 },
+    { "RAW video", "Aspect ratio", 0, 1 },
+    { "Crop mood", "Preset:", 0, 1 },
+    { "Crop mood", "Preset: ", 0, 1 },
+    { "Crop mood", "Preset:  ", 0, 1 },
+    { "Crop mood", "Aspect ratio:", 0, 1 },
+    { "Crop mood", "Framerate:", 0, 1 },
+    { "Crop mood", "Bit-depth", 0, 1 },
+    { "Overlay", "Global Draw", 1, 1 },
+    { "Debug", "SD Overclock", 2, 1 },
+};
+static struct mval * find_menu(const char * m, const char * e)
+{
+    for (int i = 0; i < COUNT(menus); i++)
+        if (!strcmp(menus[i].menu, m) && !strcmp(menus[i].entry, e)) return &menus[i];
+    return 0;
+}
+static void set_exists(const char * m, const char * e, int x) { find_menu(m, e)->exists = x; }
+static int menu_val(const char * m, const char * e) { return find_menu(m, e)->value; }
+
+/* RAW frame the recorder would produce right now (set when LiveView settles after apply) */
+static int raw_w, raw_h;
+
+/* ---------------------------------------------------------------- scheduling: task <-> GUI */
+
+static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+static int turn;                            /* 0 world/GUI, 1 module task */
+static uint32_t task_wake;
+static int task_running, task_done, task_blocked;
+static void (*task_fn)(void);
+
+static void post_frame_checks(void);
+
+static void yield_to_world(uint32_t wake, int blocked)
+{
+    pthread_mutex_lock(&mx);
+    task_wake = wake; task_blocked = blocked;
+    turn = 0; pthread_cond_broadcast(&cv);
+    while (turn != 1) pthread_cond_wait(&cv, &mx);
+    pthread_mutex_unlock(&mx);
+}
+
+void msleep(int ms)
+{
+    post_frame_checks();                    /* the task just finished a frame */
+    yield_to_world(now_ms + (ms > 0 ? ms : 1), 0);
+}
+
+/* the task is inside a slow camera call: time passes, the GUI keeps running */
+static void cam_block(int ms) { yield_to_world(now_ms + ms, 1); }
+
+static void * task_thread(void * arg)
+{
+    pthread_mutex_lock(&mx);
+    while (turn != 1) pthread_cond_wait(&cv, &mx);
+    pthread_mutex_unlock(&mx);
+    task_fn();
+    pthread_mutex_lock(&mx);
+    task_done = 1; turn = 0; pthread_cond_broadcast(&cv);
+    pthread_mutex_unlock(&mx);
+    return 0;
+}
+
+void task_create(const char * name, int prio, int stack, void (*fn)(void), void * arg)
+{
+    task_fn = fn;
+    pthread_t th;
+    pthread_create(&th, 0, task_thread, 0);
+    pthread_detach(th);
+    task_running = 1;
+}
+
+static void world_tick(void);
+
+/* advance the world; give the task its turns */
+static void run_for(int ms)
+{
+    uint32_t end = now_ms + ms;
+    while (now_ms < end)
+    {
+        now_ms += 5;
+        world_tick();
+        if (task_running && !task_done && now_ms >= task_wake)
+        {
+            pthread_mutex_lock(&mx);
+            turn = 1; pthread_cond_broadcast(&cv);
+            while (turn != 0) pthread_cond_wait(&cv, &mx);
+            pthread_mutex_unlock(&mx);
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- Canon */
+
+static void canon_redraw_screen(void)
+{
+    /* Canon's LiveView overlay: wipes the BMP layer, draws its top and bottom info */
+    memset(bmp, 0, BMPPITCH * 480);
+    for (int y = 0; y < 40; y++) memset(bmp + y * BMPPITCH, 0x01, 720);
+    for (int y = 440; y < 480; y++) memset(bmp + y * BMPPITCH, 0x01, 720);
+    canon_redraws++;
+    if (overlay_active) canon_redraws_open++;
+}
+
+static void canon_receive(int code)
+{
+    canon_got[code & 0xff]++;
+    if (!cam.lv_on || cam.playback) return;
+    switch (code)
+    {
+        case 0x1E:  /* movie button */
+            if (cam.movie) cam.recording = !cam.recording;
+            break;
+        case 0x0B:  /* PLAY */
+            cam.playback = 1; cam.lv_on = 0;
+            return;
+        case 0x06:  /* MENU */
+            cam.canon_menu = 1;
+            break;
+        case 93: case 91: case 97:  /* card door, lock, power checks: housekeeping only */
+            return;
+    }
+    canon_redraw_screen();
+}
+
+/* ---------------------------------------------------------------- the GUI task: buttons */
+
+struct keymap_entry { int canon, portable; };
+static const struct keymap_entry eosm_keys[] = {
+    { 0x02, MODULE_KEY_WHEEL_LEFT }, { 0x03, MODULE_KEY_WHEEL_RIGHT },
+    { 0x04, MODULE_KEY_PRESS_SET }, { 0x05, MODULE_KEY_UNPRESS_SET },
+    { 0x06, MODULE_KEY_MENU }, { 0x07, MODULE_KEY_INFO }, { 0x0B, MODULE_KEY_PLAY },
+    { 0x0D, MODULE_KEY_TRASH }, { 0x1E, MODULE_KEY_REC },
+    { 0x2a, MODULE_KEY_PRESS_UP }, { 0x26, MODULE_KEY_PRESS_RIGHT },
+    { 0x28, MODULE_KEY_PRESS_LEFT }, { 0x2c, MODULE_KEY_PRESS_DOWN },
+    { 0x50, MODULE_KEY_PRESS_HALFSHUTTER },
+    { 0x6f, MODULE_KEY_TOUCH_1_FINGER }, { 0x70, MODULE_KEY_UNTOUCH_1_FINGER },
+    { 0x76, MODULE_KEY_TOUCH_2_FINGER }, { 0x77, MODULE_KEY_UNTOUCH_2_FINGER },
+};
+enum {
+    K_WL = 0x02, K_WR = 0x03, K_SET = 0x04, K_SET_UP = 0x05, K_MENU = 0x06, K_INFO = 0x07,
+    K_PLAY = 0x0B, K_REC = 0x1E, K_UP = 0x2a, K_UP_UP = 0x2b, K_RIGHT = 0x26, K_RIGHT_UP = 0x27,
+    K_LEFT = 0x28, K_LEFT_UP = 0x29, K_DOWN = 0x2c, K_DOWN_UP = 0x2d, K_HALF = 0x50,
+    K_TOUCH = 0x6f, K_UNTOUCH = 0x70, K_TOUCH2 = 0x76, K_DOOR = 93, K_OLC = 105, K_UNHANDLED = 0x54,
+};
+
+static int portable(int canon)
+{
+    for (int i = 0; i < COUNT(eosm_keys); i++)
+        if (eosm_keys[i].canon == canon) return eosm_keys[i].portable;
+    return 0;                               /* what module.c hands modules for unknown codes */
+}
+
+/* one button event through ML: core first (two-finger tap opens ML's menu), then modules */
+static void gui_event(int canon)
+{
+    if (canon == K_TOUCH2 && cam.lv_on && !cam.menu_shown) { cam.menu_shown = 1; return; }
+    if (cam.menu_shown) return;             /* ML's menu eats everything while it is open */
+
+    static struct event ev;                 /* static: low address, like the camera's 32-bit pointers */
+    ev.type = 0; ev.param = canon; ev.obj = 0; ev.arg = 0;
+    if (!cam_CBR_KEYPRESS(portable(canon))) return;
+    if (!cam_CBR_KEYPRESS_RAW((unsigned int)(uintptr_t)&ev)) return;
+    canon_receive(canon);
+}
+
+/* a press and its release, the way the EOS M sends them */
+static void tap(int canon, int hold_ms)
+{
+    gui_event(canon);
+    run_for(hold_ms);
+    switch (canon)
+    {
+        case K_UP: gui_event(K_UP_UP); break;
+        case K_DOWN: gui_event(K_DOWN_UP); break;
+        case K_LEFT: gui_event(K_LEFT_UP); break;
+        case K_RIGHT: gui_event(K_RIGHT_UP); break;
+        case K_SET: gui_event(K_SET_UP); break;
+        case K_TOUCH: gui_event(K_UNTOUCH); break;
+    }
+}
+
+/* ---------------------------------------------------------------- world ticking */
+
+static uint32_t lv_back_at, last_periodic;
+static void world_tick(void)
+{
+    if (lv_back_at && now_ms >= lv_back_at)
+    {
+        cam.lv_on = 1; lv_back_at = 0;
+        canon_redraw_screen();              /* LiveView comes back with Canon's screen */
+        /* the recorder now produces the frame of whatever profile the menus describe */
+        raw_w = raw_h = 0;
+        for (int i = 0; i < profile_count; i++)
+        {
+            const struct rec_profile * p = &profiles[i];
+            static const char * pe[] = { "", "Preset:", "Preset: ", "Preset:  " };
+            if (p->mood == menu_val("Movie", "Crop mood") && p->mood > 0
+                && p->preset == menu_val("Crop mood", pe[(int)p->mood])
+                && p->ratio == menu_val("Crop mood", "Aspect ratio:")
+                && p->fps == menu_val("Crop mood", "Framerate:")
+                && p->bits == menu_val("Crop mood", "Bit-depth"))
+            { raw_w = p->nominal.width; raw_h = p->nominal.height; break; }
+        }
+    }
+    if (canon_periodic_ms && cam.lv_on && now_ms - last_periodic >= (uint32_t)canon_periodic_ms)
+    {
+        last_periodic = now_ms;
+        canon_redraw_screen();
+    }
+}
+
+static void lv_refresh(void)
+{
+    if (!cam.lv_on) return;
+    cam.lv_on = 0;
+    lv_back_at = now_ms + lv_pause_ms;
+}
+
+/* ---------------------------------------------------------------- fake ML API */
+
+int is_movie_mode(void) { return cam.movie; }
+int gui_menu_shown(void) { return cam.menu_shown; }
+int display_is_on(void) { return cam.display_on; }
+void set_lv_zoom(int z) { cam.dispsize = z; lv_refresh(); if (stall_zoom_ms) cam_block(stall_zoom_ms); }
+int fps_get_current_x1000(void) { return 23976; }
+void gui_stop_menu(void) { cam.menu_shown = 0; }
+
+int menu_get_value_from_script(const char * m, const char * e)
+{
+    struct mval * v = find_menu(m, e);
+    return v && v->exists ? v->value : INT_MIN;
+}
+int menu_set_value_from_script(const char * m, const char * e, int value)
+{
+    struct mval * v = find_menu(m, e);
+    if (!v || !v->exists) return INT_MIN;
+    int changed = v->value != value;
+    v->value = value;
+    if (changed && !strcmp(m, "Crop mood")) lv_refresh();
+    return value;
+}
+const char * menu_get_str_value_from_script(const char * m, const char * e, struct menu_display_info * info)
+{
+    if (!strcmp(e, "RAW video"))
+        snprintf(info->value, sizeof(info->value), "%s, %dx%d", menu_val(m, e) ? "ON" : "OFF", raw_w, raw_h);
+    else snprintf(info->value, sizeof(info->value), "%d", menu_get_value_from_script(m, e));
+    return info->value;
+}
+
+uint8_t * bmp_vram_real(void) { return bmp; }
+void canon_gui_disable_front_buffer(void) { cam.front_enabled = 0; begin_pending = 1; }
+void canon_gui_enable_front_buffer(int x) { cam.front_enabled = 1; }
+void clrscr(void) { memset(bmp, 0, BMPPITCH * 480); }
+uint32_t get_ms_clock(void) { return now_ms; }
+void redraw(void) { if (cam.lv_on && !cam.playback) canon_redraw_screen(); }
+void bmp_fill(uint8_t col, int x, int y, int w, int h)
+{
+    if (x < 0 || y < 0 || x + w > 720 || y + h > 480) { FAIL("bmp_fill out of the screen"); return; }
+    for (int r = y; r < y + h; r++) memset(bmp + r * BMPPITCH + x, col, w);
+}
+
+/* the heap: sizes are kept in a header so leaks can be counted */
+void * cam_malloc(size_t n)
+{
+    if (fail_big_malloc && n >= 100000) { fail_big_malloc = 0; return 0; }
+    size_t * p = malloc(n + 16);
+    if (!p) return 0;
+    p[0] = n; heap_live += n; if (heap_live > heap_peak) heap_peak = heap_live;
+    return (char *)p + 16;
+}
+void cam_free(void * q)
+{
+    if (!q) return;
+    size_t * p = (size_t *)((char *)q - 16);
+    heap_live -= p[0];
+    free(p);
+}
+
+/* the card: a DCIM folder with whatever MLV files the scenario puts there */
+struct fake_file { char name[64]; uint32_t size, ts; };
+static struct fake_file dcim[16];
+static int dcim_n;
+const char * get_dcim_dir(void) { return "B:/DCIM/100CANON/"; }
+static struct fio_dirent the_dirent;
+struct fio_dirent * FIO_FindFirstEx(const char * dir, struct fio_file * f)
+{
+    if (!dcim_n) return 0;
+    the_dirent.i = 0;
+    snprintf(f->name, sizeof(f->name), "%s", dcim[0].name); f->mode = 0; f->timestamp = dcim[0].ts;
+    return &the_dirent;
+}
+int FIO_FindNextEx(struct fio_dirent * d, struct fio_file * f)
+{
+    if (++d->i >= dcim_n) return 1;
+    snprintf(f->name, sizeof(f->name), "%s", dcim[d->i].name); f->mode = 0; f->timestamp = dcim[d->i].ts;
+    return 0;
+}
+void FIO_FindClose(struct fio_dirent * d) {}
+int FIO_GetFileSize(const char * path, uint32_t * size)
+{
+    const char * base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    for (int i = 0; i < dcim_n; i++)
+        if (!strcmp(dcim[i].name, base)) { *size = dcim[i].size; return 0; }
+    return -1;
+}
+void NotifyBox(int ms, const char * fmt, ...)
+{
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(notify_last, sizeof(notify_last), fmt, ap);
+    va_end(ap);
+    notify_count++;
+}
+static struct card_info the_card;
+struct card_info * get_shooting_card(void) { return &the_card; }
+int get_free_space_32k(struct card_info * c) { return 32 * 1000 * 30; }
+
+static const char * profiles_txt;           /* NULL: no PROFILES.TXT on the card */
+const char * get_config_dir(void) { return "ML/SETTINGS/"; }
+void * read_entire_file(const char * path, int * size)
+{
+    if (!profiles_txt) { *size = 0; return 0; }
+    int n = strlen(profiles_txt);
+    char * b = cam_malloc(n);
+    memcpy(b, profiles_txt, n);
+    *size = n;
+    return b;
+}
+void fio_free(void * p) { cam_free(p); }
+int is_camera(const char * m, const char * fw) { return !strcmp(m, "EOSM") && !strcmp(fw, "2.0.2"); }
+
+static struct menu_entry * menu_root;
+static int menu_n;
+void menu_add(const char * parent, struct menu_entry * e, int n) { menu_root = e; menu_n = n; }
+static struct lvinfo_item * lv_items;
+void lvinfo_add_items(struct lvinfo_item * items, int n) { lv_items = items; }
+
+/* ---------------------------------------------------------------- invariants after every frame */
+
+extern void camsim_dump(const uint8_t * bmp960, const char * dir, int n);
+
+static int was_overlay;
+static void post_frame_checks(void)
+{
+    frames_checked++;
+    int settled = overlay_active && panel_settled(&panel);
+    if (settled && back_buf)
+    {
+        for (int y = 0; y < UI_H; y++)
+            if (memcmp(bmp + y * BMPPITCH, back.px + y * back.pitch, UI_W))
+            {
+                settled_mismatch++;
+                int x = 0; while (x < UI_W && bmp[y * BMPPITCH + x] == back.px[y * back.pitch + x]) x++;
+                int rows_bad = 0; for (int yy = 0; yy < UI_H; yy++) rows_bad += !!memcmp(bmp + yy * BMPPITCH, back.px + yy * back.pitch, UI_W);
+                FAIL("screen differs from the panel on row %d (x %d: screen %02x panel %02x; %d rows differ) state %d half %d prev %d-%d lv %d",
+                     y, x, bmp[y * BMPPITCH + x], back.px[y * back.pitch + x], rows_bad, panel.state,
+                     tween_value(&panel.reveal, now_ms), panel.prev_y0, panel.prev_y1, cam.lv_on);
+                break;
+            }
+    }
+    if (getenv("TRACE2") && now_ms > (uint32_t)atoi(getenv("TRACE2"))) fprintf(stderr, "    f @%u ov %d st %d half %d lv %d movie %d menu %d disp %d apply %d ring %d/%d bp %d\n", now_ms, overlay_active, panel.state, tween_value(&panel.reveal, now_ms), cam.lv_on, cam.movie, cam.menu_shown, cam.display_on, apply_phase, key_head, key_tail, begin_pending);
+    if (overlay_active) begin_pending = 0;
+    if (was_overlay && !overlay_active && !begin_pending)
+    {
+        /* the panel just handed the screen back */
+        EXPECT(cam.front_enabled, "Canon's front buffer was left disabled");
+        EXPECT(back_buf == 0, "panel buffer (338 KB) not freed after close");
+        EXPECT(menu_val("Overlay", "Global Draw") == global_draw_at_start,
+               "Global Draw left at %d (was %d)", menu_val("Overlay", "Global Draw"), global_draw_at_start);
+    }
+    if (getenv("TRACE") && was_overlay != overlay_active) fprintf(stderr, "  trace @%u overlay %d lv %d apply %d state %d keys_released %d menu %d rec %d\n", now_ms, overlay_active, cam.lv_on, apply_phase, panel.state, keys_released, cam.menu_shown, cam.recording);
+    was_overlay = overlay_active;
+    if (dump_dir) camsim_dump(bmp, dump_dir, dump_n++);
+}
+
+/* ---------------------------------------------------------------- scenario helpers */
+
+static void boot(void)
+{
+    memset(&cam, 0, sizeof(cam));
+    cam.lv_on = 1; cam.movie = 1; cam.display_on = 1; cam.front_enabled = 1; cam.dispsize = 1;
+    cam.lens.focal_len = 22;
+    bmp = cam_malloc(BMPPITCH * 480);
+    heap_live = 0;                          /* the screen is not the module's */
+    memset(bmp, 0, BMPPITCH * 480);
+    EXPECT(cam_mod_init() == 0, "module init failed");
+    run_for(300);
+}
+
+static int panel_open_now(void) { return overlay_active && panel.state != PS_CLOSED; }
+
+static void open_panel(void)
+{
+    tap(K_INFO, 0);
+    run_for(800);
+    EXPECT(panel_open_now() && panel.state == PS_OPEN, "INFO did not open the panel (state %d)", panel.state);
+}
+
+static void close_panel(void)
+{
+    tap(K_INFO, 0);
+    run_for(800);
+    EXPECT(!overlay_active, "panel did not close");
+}
+
+static void finish(void)
+{
+    if (overlay_active) close_panel();
+    run_for(300);
+    EXPECT(heap_live == 0, "heap: %ld bytes still allocated (leak)", heap_live);
+}
+
+/* ---------------------------------------------------------------- scenarios */
+
+static void s_basic_navigation(void)
+{
+    boot(); open_panel();
+    int sel0 = panel.sel;
+    int r0 = canon_redraws_open;
+    for (int i = 0; i < 3; i++) { tap(K_DOWN, 80); run_for(120); }
+    EXPECT(panel.sel == sel0 + 3, "DOWN x3 moved selection %d -> %d", sel0, panel.sel);
+    tap(K_UP, 80); run_for(200);
+    EXPECT(panel.sel == sel0 + 2, "UP did not move selection back");
+    tap(K_WR, 0); tap(K_WR, 0); run_for(200);
+    EXPECT(panel.sel == sel0 + 4, "rear dial did not scroll");
+    EXPECT(canon_redraws_open == r0, "Canon redrew over the panel %d times while navigating (the black flash)",
+           canon_redraws_open - r0);
+    EXPECT(!canon_got[K_DOWN] && !canon_got[K_DOWN_UP] && !canon_got[K_UP_UP], "navigation keys leaked to Canon");
+    EXPECT(panel_open_now(), "panel closed while navigating");
+    finish();
+}
+
+static void s_double_info(void)
+{
+    boot();
+    tap(K_INFO, 0);
+    for (int i = 0; i < 100 && !(begin_pending && !overlay_active); i++) run_for(5);
+    EXPECT(begin_pending && !overlay_active, "could not catch the start-up window");
+    tap(K_INFO, 0);                         /* a second INFO lands mid start-up */
+    run_for(900);
+    EXPECT(panel_open_now(), "double INFO: panel not open");
+    close_panel();
+    run_for(1500);
+    EXPECT(!overlay_active, "double INFO: the panel reopened by itself after closing");
+    finish();
+}
+
+static void s_themes_all(void)
+{
+    boot(); open_panel();
+    int t0 = cfg_theme;
+    for (int i = 0; i < THEME_COUNT; i++) { tap(K_RIGHT, 60); run_for(250); }
+    EXPECT(cfg_theme == t0, "RIGHT x%d did not wrap to the same theme", THEME_COUNT);
+    for (int i = 0; i < 3; i++) { tap(K_LEFT, 60); run_for(250); }
+    EXPECT(cfg_theme == (t0 + THEME_COUNT - 3) % THEME_COUNT, "LEFT x3 went to %d", cfg_theme);
+    EXPECT(panel_open_now(), "panel closed while changing themes");
+    finish();
+}
+
+static void s_key_mash(void)
+{
+    boot(); open_panel();
+    static const int keys[] = { K_UP, K_DOWN, K_LEFT, K_RIGHT, K_WL, K_WR, K_TOUCH, K_UNHANDLED, K_OLC };
+    srand(7);
+    for (int i = 0; i < 600; i++) { tap(keys[rand() % COUNT(keys)], rand() % 30); run_for(rand() % 25); }
+    run_for(600);
+    EXPECT(panel_open_now(), "600 random navigation keys closed the panel");
+    EXPECT(panel.sel >= 0 && panel.sel < profile_count, "selection out of range: %d", panel.sel);
+    finish();
+}
+
+static void s_keys_during_animations(void)
+{
+    boot();
+    tap(K_INFO, 0); run_for(40);            /* iris still opening */
+    tap(K_DOWN, 30); tap(K_DOWN, 30);
+    run_for(800);
+    EXPECT(panel.state == PS_OPEN, "keys during the open animation broke the panel");
+    tap(K_INFO, 0); run_for(20);            /* closing ... */
+    tap(K_SET, 20);                         /* ... and SET while it closes: must not apply */
+    run_for(1500);
+    EXPECT(!overlay_active, "panel did not close");
+    EXPECT(menu_val("Movie", "Crop mood") == 0, "a SET pressed while closing applied a profile");
+    finish();
+}
+
+static void s_rapid_toggle(void)
+{
+    boot();
+    for (int i = 0; i < 40; i++) { tap(K_INFO, 0); run_for(15 + (i % 7) * 20); }
+    run_for(1500);
+    if (overlay_active) close_panel();
+    run_for(500);
+    EXPECT(!overlay_active, "rapid INFO toggling left the panel open");
+    EXPECT(cam.front_enabled, "front buffer left disabled");
+    finish();
+}
+
+static void s_rec_while_open(void)
+{
+    boot(); open_panel();
+    tap(K_REC, 0); run_for(400);
+    EXPECT(cam.recording, "REC pressed with the panel open did not start recording");
+    EXPECT(!overlay_active, "panel still up while recording");
+    cam.recording = 0;
+    finish();
+}
+
+static void s_play_while_open(void)
+{
+    boot(); open_panel();
+    tap(K_PLAY, 0); run_for(400);
+    EXPECT(cam.playback, "PLAY with the panel open did not open playback");
+    EXPECT(!overlay_active, "panel still up in playback");
+    cam.playback = 0; cam.lv_on = 1;
+    finish();
+}
+
+static void s_menu_while_open(void)
+{
+    boot(); open_panel();
+    tap(K_TOUCH2, 0);                       /* two-finger tap: ML's menu */
+    run_for(100);
+    EXPECT(!overlay_active, "panel still drawing over ML's menu 100 ms after it opened");
+    cam.menu_shown = 0;
+    finish();
+}
+
+static void s_mode_switch_while_open(void)
+{
+    boot(); open_panel();
+    cam.movie = 0;                          /* mode switch to photo; LiveView stays */
+    run_for(300);
+    EXPECT(!overlay_active, "panel stayed open after switching to photo mode");
+    cam.movie = 1;
+    finish();
+}
+
+static void s_display_off_while_open(void)
+{
+    boot(); open_panel();
+    cam.display_on = 0;
+    run_for(300);
+    EXPECT(!overlay_active, "panel stayed open with the display off");
+    cam.display_on = 1;
+    finish();
+}
+
+static void s_recording_starts_elsewhere(void)
+{
+    boot(); open_panel();
+    cam.recording = 1; cam.raw = 1;         /* e.g. a remote, or ML's own trigger */
+    run_for(200);
+    EXPECT(!overlay_active, "panel up while recording");
+    run_for(500);
+    cam.recording = 0;
+    run_for(1500);
+    finish();
+}
+
+static int find_profile(int mood)
+{
+    for (int i = 0; i < profile_count; i++) if (profiles[i].mood == mood) return i;
+    return -1;
+}
+
+static void select_profile(int idx)
+{
+    while (panel.sel < idx) { tap(K_DOWN, 30); run_for(60); }
+    while (panel.sel > idx) { tap(K_UP, 30); run_for(60); }
+    run_for(300);
+}
+
+static void s_apply_with_lv_refresh(void)
+{
+    boot(); open_panel();
+    int idx = find_profile(MOOD_1X1);
+    select_profile(idx);
+    tap(K_SET, 40);
+    run_for(1200);                          /* LiveView restarted meanwhile */
+    EXPECT(overlay_active, "the LiveView refresh during apply closed the panel");
+    EXPECT(cfg_active == idx, "active profile %d, expected %d", cfg_active, idx);
+    EXPECT(menu_val("Movie", "Crop mood") == profiles[idx].mood, "Crop mood not set");
+    EXPECT(menu_val("Movie", "RAW video") == 1, "RAW video not enabled");
+    EXPECT(cam.dispsize == 5, "x5 zoom not set");
+    EXPECT(strstr(panel.toast, "Ready") != 0, "toast after apply: \"%s\"", panel.toast);
+    run_for(4000);
+    EXPECT(!overlay_active, "panel did not close itself after a successful apply");
+
+    /* apply again, then keep browsing: a key cancels the auto-close */
+    open_panel();
+    select_profile(idx);
+    tap(K_SET, 40);
+    run_for(1200);
+    tap(K_DOWN, 30);
+    run_for(4000);
+    EXPECT(overlay_active && panel.state == PS_OPEN, "a key after the result did not keep the panel open");
+    EXPECT(panel.sel == idx + 1 || idx == profile_count - 1, "the key that dismissed the result was lost");
+    finish();
+}
+
+static void s_apply_off(void)
+{
+    boot(); open_panel();
+    int idx = find_profile(MOOD_OFF);
+    if (idx < 0) { finish(); return; }
+    select_profile(idx);
+    tap(K_SET, 40);
+    run_for(2500);
+    EXPECT(menu_val("Movie", "RAW video") == 0 && menu_val("Movie", "Crop mood") == 0, "H.264 profile left RAW on");
+    EXPECT(strstr(panel.toast, "H.264") != 0, "toast: \"%s\"", panel.toast);
+    finish();
+}
+
+static void s_apply_modules_missing(void)
+{
+    boot();
+    set_exists("Movie", "Crop mood", 0);    /* crop_rec not loaded */
+    open_panel();
+    select_profile(find_profile(MOOD_1X1));
+    tap(K_SET, 40);
+    run_for(1500);
+    EXPECT(strstr(panel.toast, "crop_rec") != 0, "toast without crop_rec: \"%s\"", panel.toast);
+    EXPECT(menu_val("Movie", "RAW video") == 0, "RAW video turned on although the apply failed (half-applied)");
+    EXPECT(cfg_active == -1, "failed apply changed the active profile");
+    set_exists("Movie", "Crop mood", 1);
+    set_exists("Movie", "RAW video", 0);    /* mlv_lite not loaded */
+    select_profile(find_profile(MOOD_1X1));
+    tap(K_SET, 40);
+    run_for(1500);
+    EXPECT(strstr(panel.toast, "mlv_lite") != 0, "toast without mlv_lite: \"%s\"", panel.toast);
+    finish();
+}
+
+static void s_stalled_task_watchdog(void)
+{
+    boot(); open_panel();
+    stall_zoom_ms = 3500;                   /* the task hangs inside set_lv_zoom */
+    select_profile(find_profile(MOOD_1X1));
+    tap(K_SET, 40);
+    run_for(2600);
+    int before = canon_got[K_HALF];
+    tap(K_HALF, 0);
+    EXPECT(canon_got[K_HALF] == before + 1, "buttons still held by a stalled panel after 2.6 s");
+    stall_zoom_ms = 0;
+    run_for(3000);
+    EXPECT(!overlay_active || panel_open_now(), "inconsistent state after the stall");
+    if (overlay_active) close_panel();
+    run_for(500);
+    EXPECT(cam.front_enabled, "front buffer disabled after the watchdog");
+    EXPECT(menu_val("Overlay", "Global Draw") == 1, "Global Draw stayed OFF after the watchdog");
+    open_panel();
+    finish();
+}
+
+static void s_malloc_failure(void)
+{
+    boot();
+    fail_big_malloc = 1;
+    tap(K_INFO, 0); run_for(500);
+    EXPECT(!overlay_active, "panel opened without its buffer");
+    EXPECT(cam.front_enabled, "front buffer disabled after a failed open");
+    open_panel();                           /* works again once memory is there */
+    finish();
+}
+
+static void s_stale_keys_on_menu_open(void)
+{
+    boot(); open_panel();
+    tap(K_INFO, 0);                         /* close ... */
+    tap(K_SET, 10);                         /* ... with keys arriving during the close */
+    tap(K_DOWN, 10);
+    run_for(1200);
+    EXPECT(!overlay_active, "did not close");
+    /* now open from the ML menu (does not go through the INFO path) */
+    cam.menu_shown = 1;
+    menu_root->select(0, 1);
+    run_for(1200);
+    EXPECT(panel_open_now(), "Mothlight > Open profiles did not open the panel");
+    EXPECT(menu_val("Movie", "Crop mood") == 0, "stale SET from the last session applied a profile");
+    finish();
+}
+
+static void s_info_in_photo_mode(void)
+{
+    boot();
+    cam.movie = 0;
+    int before = canon_got[K_INFO];
+    tap(K_INFO, 0); run_for(400);
+    EXPECT(!overlay_active, "panel opened in photo mode");
+    EXPECT(canon_got[K_INFO] == before + 1, "INFO in photo mode did not reach Canon");
+    finish();
+}
+
+static void s_housekeeping_events_pass(void)
+{
+    boot(); open_panel();
+    int d = canon_got[K_DOOR], o = canon_got[K_OLC];
+    gui_event(K_DOOR); gui_event(K_OLC);
+    run_for(100);
+    EXPECT(canon_got[K_DOOR] == d + 1, "card door event swallowed while the panel is open");
+    EXPECT(canon_got[K_OLC] == o + 1, "Canon info-changed event swallowed while the panel is open");
+    finish();
+}
+
+static void s_halfshutter(void)
+{
+    boot(); open_panel();
+    int h = canon_got[K_HALF];
+    tap(K_HALF, 0); run_for(500);
+    EXPECT(canon_got[K_HALF] == h + 1, "half-shutter did not reach Canon (no focus)");
+    EXPECT(!overlay_active, "half-shutter did not close the panel");
+    finish();
+}
+
+static void s_canon_periodic_redraw(void)
+{
+    boot();
+    canon_periodic_ms = 700;                /* Canon refreshes its screen by itself */
+    open_panel();
+    run_for(3000);                          /* post-frame check fails if not repaired */
+    canon_periodic_ms = 0;
+    finish();
+}
+
+static void s_profiles_variants(void)
+{
+    static char many[4096];
+    char * p = many;
+    for (int i = 0; i < 20; i++)
+        p += sprintf(p, "Profile number %d with a very long name indeed | 1:1 | 3K | 2.39 | 23.976 | 10\n", i);
+    const char * cases[] = {
+        "",
+        "# only a comment\n",
+        "garbage line\n\x01\x02\xff\n| | | |\n",
+        "Solo | 1x3 | highest | 2.39 | 23.976 | 12\n",
+        many,
+        "No newline at end | 3x3 | 1080p | 16:9 | 25 | 14",
+        "A | 1:1 | 2.8K | 2.35 | 30 | 11\r\nB | off | | | | \r\n",
+    };
+    for (int c = 0; c < COUNT(cases); c++)
+    {
+        pid_t pid = fork();
+        if (pid == 0)
+        {
+            profiles_txt = cases[c];
+            boot();
+            EXPECT(profile_count > 0 && profile_count <= MAX_PROFILES, "case %d: %d profiles", c, profile_count);
+            open_panel();
+            for (int i = 0; i < profile_count + 3; i++) { tap(K_DOWN, 20); run_for(60); }
+            EXPECT(panel.sel == profile_count - 1, "case %d: DOWN past the end: sel %d of %d", c, panel.sel, profile_count);
+            for (int i = 0; i < profile_count + 3; i++) { tap(K_UP, 20); run_for(60); }
+            EXPECT(panel.sel == 0, "case %d: UP past the top: sel %d", c, panel.sel);
+            run_for(400);
+            finish();
+            _exit(failures ? 1 : 0);
+        }
+        int st; waitpid(pid, &st, 0);
+        if (!WIFEXITED(st) || WEXITSTATUS(st)) { failures++; fprintf(stderr, "  FAIL [%s] PROFILES.TXT case %d\n", scenario, c); }
+    }
+}
+
+static void s_parser_fuzz(void)
+{
+    static struct rec_profile out[MAX_PROFILES];
+    char buf[512];
+    srand(11);
+    const char * parts[] = { "|", " ", "\n", "1:1", "1x3", "3x3", "off", "3K", "2.5K", "highest", "1080p",
+                             "2.39", "16:9", "23.976", "25", "10", "12", "14", "#", "x", "\r", "99999999999" };
+    for (int i = 0; i < 20000; i++)
+    {
+        int n = 0, len = rand() % 60;
+        for (int k = 0; k < len && n < 480; k++)
+        {
+            if (rand() % 5 == 0) buf[n++] = (char)(rand() % 255 + 1);
+            else { const char * s = parts[rand() % COUNT(parts)]; int l = strlen(s); memcpy(buf + n, s, l); n += l; }
+        }
+        buf[n] = 0;
+        int bad = 0;
+        int c = profiles_parse(buf, out, MAX_PROFILES, &bad);
+        EXPECT(c >= 0 && c <= MAX_PROFILES, "parser returned %d", c);
+        for (int j = 0; j < c; j++)
+        {
+            char s[96];
+            profile_summary(&out[j], s, sizeof(s));
+            EXPECT(out[j].nominal.width > 0 || out[j].mood == MOOD_OFF, "profile with no frame size");
+        }
+    }
+}
+
+static void s_bad_config_at_boot(void)
+{
+    cfg_theme = 99; cfg_active = 40; cfg_card = 77; cfg_tally = 9; cfg_bpp10 = -5;
+    boot();
+    open_panel();
+    tap(K_RIGHT, 30); run_for(300);
+    EXPECT(cfg_theme >= 0 && cfg_theme < THEME_COUNT, "theme index %d after a corrupt config", cfg_theme);
+    struct menu_display_info info = { 0 };
+    for (struct menu_entry * e = menu_root; e < menu_root + menu_n; e++)
+    {
+        if (e->update) e->update(e, &info);
+        for (struct menu_entry * c = e->children; c && c->name; c++) if (c->update) c->update(c, &info);
+    }
+    lv_items[0].update(&lv_items[0], 1);
+    finish();
+}
+
+static void s_reduced_motion(void)
+{
+    cfg_motion = 0;
+    boot();
+    tap(K_INFO, 0); run_for(150);
+    EXPECT(panel.state == PS_OPEN, "with animations off the panel is not open after 150 ms");
+    tap(K_DOWN, 20); run_for(100);
+    tap(K_INFO, 0); run_for(150);
+    EXPECT(!overlay_active, "with animations off the panel is not closed after 150 ms");
+    finish();
+}
+
+static void s_learning(void)
+{
+    boot();
+    /* a 10-bit profile is live; record 4 s */
+    int idx = -1;
+    for (int i = 0; i < profile_count; i++) if (profiles[i].mood == MOOD_1X1 && profile_bits(&profiles[i]) == 10) { idx = i; break; }
+    open_panel(); select_profile(idx); tap(K_SET, 30); run_for(5000);
+    EXPECT(!overlay_active, "panel did not close itself after applying");
+    run_for(2500);                          /* the task reads the live format every 2 s */
+    cam.recording = 1; cam.raw = 1;
+    run_for(4000);
+    /* 4 s at ~5.7 bit/px */
+    const struct rec_format * f = &profiles[idx].nominal;
+    uint32_t kB = (uint32_t)((long long)f->width * f->height * f->fps_x1000 / 1000 * 4 * 570 / 800 / 1000);
+    snprintf(dcim[0].name, 64, "M23-1200.MLV"); dcim[0].size = kB * 1000 / 2; dcim[0].ts = 100;
+    snprintf(dcim[1].name, 64, "M23-1200.M00"); dcim[1].size = kB * 1000 / 2; dcim[1].ts = 100;
+    dcim_n = 2;
+    cam.recording = 0;
+    run_for(1500);
+    EXPECT(notify_count == 1 && strstr(notify_last, "Learned: 10-bit"), "after a clip: \"%s\" (%d notes)", notify_last, notify_count);
+    EXPECT(cfg_learned & 1, "10-bit not marked as learned");
+    /* a clip with no files on the card must not learn garbage */
+    cam.recording = 1; run_for(1000); dcim_n = 0; cam.recording = 0; run_for(1500);
+    EXPECT(notify_count == 1, "learned from a clip that is not on the card");
+    finish();
+}
+
+static void s_soak(void)
+{
+    const char * seed_s = getenv("SEED");
+    unsigned seed = seed_s ? (unsigned)atoi(seed_s) : 1;
+    srand(seed);
+    boot();
+    static const int keys[] = { K_UP, K_DOWN, K_LEFT, K_RIGHT, K_WL, K_WR, K_SET, K_INFO, K_INFO, K_INFO,
+                                K_HALF, K_TOUCH, K_UNHANDLED, K_OLC, K_DOOR, K_REC, K_MENU, K_PLAY };
+    int opens = 0;
+    for (int step = 0; step < 4000; step++)
+    {
+        int r = rand() % 100;
+        if (r < 70) tap(keys[rand() % COUNT(keys)], rand() % 60);
+        else if (r < 74) { cam.movie = !cam.movie; }
+        else if (r < 77) { cam.menu_shown = 1; run_for(200 + rand() % 400); cam.menu_shown = 0; }
+        else if (r < 80) { cam.display_on = 0; run_for(300); cam.display_on = 1; }
+        else if (r < 83) lv_refresh();
+        else if (r < 85) { cam.recording = 0; }
+        else if (r < 87) { cam.playback = 0; cam.lv_on = 1; cam.canon_menu = 0; }
+        else if (r < 88) { stall_zoom_ms = 2500; }
+        else if (r < 90) { stall_zoom_ms = 0; }
+        else if (r < 91) { canon_periodic_ms = canon_periodic_ms ? 0 : 900; }
+        run_for(rand() % 150);
+        if (overlay_active) opens++;
+        /* keep the world able to show the panel most of the time */
+        if (rand() % 10 == 0) { cam.movie = 1; cam.playback = 0; cam.lv_on = 1; cam.recording = 0; cam.menu_shown = 0; }
+    }
+    stall_zoom_ms = 0; canon_periodic_ms = 0;
+    cam.movie = 1; cam.playback = 0; cam.lv_on = 1; cam.recording = 0; cam.menu_shown = 0; cam.display_on = 1;
+    run_for(7000);
+    if (overlay_active) close_panel();
+    run_for(1000);
+    EXPECT(!overlay_active && cam.front_enabled, "soak: did not end closed and clean");
+    EXPECT(heap_live == 0, "soak: %ld bytes leaked", heap_live);
+    EXPECT(menu_val("Overlay", "Global Draw") == 1, "soak: Global Draw left off");
+    EXPECT(opens > 100, "soak: panel was barely open (%d steps), test not meaningful", opens);
+    printf("    soak seed %u: %d steps with the panel open, %d frames checked, %u s simulated\n",
+           seed, opens, frames_checked, now_ms / 1000);
+    open_panel();                           /* and it still works */
+    finish();
+}
+
+/* ---------------------------------------------------------------- runner */
+
+struct sc { const char * name; void (*fn)(void); };
+static const struct sc all[] = {
+    { "basic navigation (no flash, no leak)", s_basic_navigation },
+    { "double INFO during start-up (no ghost reopen)", s_double_info },
+    { "all themes, both directions", s_themes_all },
+    { "600 random keys incl. touch and unknown events", s_key_mash },
+    { "keys during open/close animations", s_keys_during_animations },
+    { "rapid INFO toggling", s_rapid_toggle },
+    { "REC with the panel open", s_rec_while_open },
+    { "PLAY with the panel open", s_play_while_open },
+    { "ML menu (two-finger tap) with the panel open", s_menu_while_open },
+    { "switch to photo mode with the panel open", s_mode_switch_while_open },
+    { "display turns off with the panel open", s_display_off_while_open },
+    { "recording started elsewhere", s_recording_starts_elsewhere },
+    { "apply a RAW profile (LiveView refresh, x5 zoom)", s_apply_with_lv_refresh },
+    { "apply the H.264 profile", s_apply_off },
+    { "apply with crop_rec / mlv_lite not loaded", s_apply_modules_missing },
+    { "task stalls 3.5 s: watchdog and recovery", s_stalled_task_watchdog },
+    { "out of memory when opening", s_malloc_failure },
+    { "stale keys, then open from the ML menu", s_stale_keys_on_menu_open },
+    { "INFO in photo mode", s_info_in_photo_mode },
+    { "card door / Canon housekeeping events pass", s_housekeeping_events_pass },
+    { "half-shutter closes and focuses", s_halfshutter },
+    { "Canon redraws on its own every 0.7 s", s_canon_periodic_redraw },
+    { "PROFILES.TXT: empty, garbage, 20 long names, CRLF ...", s_profiles_variants },
+    { "profile parser fuzz (20 000 inputs)", s_parser_fuzz },
+    { "corrupt config values at boot", s_bad_config_at_boot },
+    { "animations off", s_reduced_motion },
+    { "learning compression from a clip", s_learning },
+    { "soak: 4000 random steps of keys and camera events", s_soak },
+};
+
+extern void camsim_load_fonts(const char * dir);
+
+int main(int argc, char ** argv)
+{
+    const char * only = getenv("ONLY");
+    int failed = 0, ran = 0;
+    for (int i = 0; i < COUNT(all); i++)
+    {
+        if (only && !strstr(all[i].name, only)) continue;
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0)
+        {
+            if (argc > 1) camsim_load_fonts(argv[1]);
+            if (argc > 2) dump_dir = argv[2];
+            scenario = all[i].name;
+            all[i].fn();
+            fflush(stdout);
+            _exit(failures ? 1 : 0);
+        }
+        int st; waitpid(pid, &st, 0);
+        int ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        printf("%s  %s%s\n", ok ? "pass" : "FAIL", all[i].name,
+               WIFSIGNALED(st) ? "  (crashed)" : "");
+        failed += !ok; ran++;
+    }
+    printf("\n%d of %d scenarios passed\n", ran - failed, ran);
+    return failed != 0;
+}

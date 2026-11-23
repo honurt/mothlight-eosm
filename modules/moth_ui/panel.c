@@ -545,6 +545,16 @@ void panel_theme_changed(struct panel * p)
 
 int panel_key(struct panel * p, const struct panel_view * v, int key, uint32_t now)
 {
+    if (p->state == PS_DONE && key != PK_NONE)
+    {
+        /* a result is showing: INFO / MENU close, anything else dismisses it and goes on
+           browsing (it also cancels the auto-close after a successful apply) */
+        if (key == PK_CLOSE) { panel_close(p, v, now); return PA_CLOSED_BY_USER; }
+        p->state = PS_OPEN;
+        p->t_state = now;
+        p->toast[0] = 0;
+        p->footer_dirty = p->list_dirty = 1;
+    }
     switch (p->state)
     {
         case PS_OPENING:
@@ -566,9 +576,6 @@ int panel_key(struct panel * p, const struct panel_view * v, int key, uint32_t n
                     panel_close(p, v, now);
                     return PA_CLOSED_BY_USER;
             }
-            return PA_NONE;
-        case PS_DONE:
-            if (key != PK_NONE) { panel_close(p, v, now); return PA_CLOSED_BY_USER; }
             return PA_NONE;
         default:
             return PA_NONE;
