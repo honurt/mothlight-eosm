@@ -39,6 +39,7 @@ struct panel_view
     int bpp_learned_mask;       /* bit (bits-10) set = learned from your clips */
     int card_kBps;              /* write speed used for the verdicts */
     int card_auto;              /* card_kBps came from the SD clock setting, not measured */
+    int sd_clock;               /* Debug > SD Overclock: 0 OFF, 1..3 on, -1 sd_uhs not loaded */
     int free_MB;                /* -1 unknown */
     int battery;                /* 0..100, -1 unknown */
     const char * engine;        /* "Crop Mood" */

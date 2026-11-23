@@ -32,9 +32,13 @@ int ui_text_w(int font, const char * s)
 }
 
 #ifdef MOTH_SIM
-/* simulator builds count text that does not fit its area (the tests fail on it) */
+/* simulator builds count text that does not fit its area (the tests fail on it),
+   and keep what was drawn so tests can read the screen */
 int ui_text_overflows;
 char ui_text_overflow_last[96];
+char ui_text_drawn[16384];
+static int drawn_len;
+void ui_text_drawn_reset(void) { drawn_len = 0; ui_text_drawn[0] = 0; }
 #endif
 
 int ui_text(struct canvas * c, int font, int x, int y, uint8_t fg, int align, const char * s)
@@ -49,6 +53,8 @@ int ui_text(struct canvas * c, int font, int x, int y, uint8_t fg, int align, co
     int r0 = c->cy0 - y; if (r0 < 0) r0 = 0;
     int r1 = c->cy1 - y; if (r1 > f->height) r1 = f->height;
 #ifdef MOTH_SIM
+    if (r1 > r0 && drawn_len < (int)sizeof(ui_text_drawn) - 100)
+        drawn_len += snprintf(ui_text_drawn + drawn_len, sizeof(ui_text_drawn) - drawn_len, "%s\n", s);
     if (r1 > r0 && (x < c->cx0 || x + w > c->cx1))
     {
         ui_text_overflows++;

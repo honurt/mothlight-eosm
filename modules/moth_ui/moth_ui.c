@@ -88,8 +88,12 @@ static volatile int keys_released;          /* watchdog tripped: keys go to Cano
 static uint32_t lv_lost_at;                 /* LiveView went away (Crop Mood restarts it while applying) */
 static int saved_global_draw = -1;
 
-static int apply_phase;                     /* 0 idle, 1 settings sent, 2 waiting for LiveView */
+static int apply_phase;                     /* 0 idle, 1 start, 2 helper busy, 3 waiting for LiveView */
 static uint32_t apply_t0;
+static volatile int apply_helper;           /* 1 running, 2 finished */
+static const char * volatile apply_err;
+static uint32_t repaint_until;              /* repaint every frame until then (after keys, during apply) */
+static int was_lv = 1;
 
 static struct rec_format live_fmt;          /* what RAW video is set to now (read at 1 Hz) */
 static int was_recording;
@@ -98,6 +102,74 @@ static struct rec_format rec_fmt;
 static int tally_drawn;
 
 static volatile int task_quit;
+
+/* ---------------------------------------------------------------- event log
+ * What the camera actually sent while the panel was up, and why it closed: written to
+ * ML/LOGS/MOTHLOG.TXT after the panel closes (never while recording). Buttons behave
+ * differently on the camera than in any simulator; this is how we find out how. */
+
+enum { CLOSE_KEY = 1, CLOSE_KEY_PASS, CLOSE_MENU, CLOSE_REC, CLOSE_PHOTO, CLOSE_DISPLAY, CLOSE_LV,
+       CLOSE_WATCHDOG, CLOSE_DONE };
+static const char * close_why[] = { "", "closed by a key", "closed by REC/PLAY/shutter", "ML menu opened",
+                                    "recording started", "photo mode", "display off", "LiveView gone",
+                                    "watchdog (task stalled)", "auto-close after apply" };
+
+struct log_ev { uint32_t t; short code; char kind; signed char a, b; };
+#define LOG_N 192
+static struct log_ev log_ring[LOG_N];
+static volatile unsigned log_n;
+static volatile int log_dirty;
+
+static void mlog(char kind, int code, int a, int b)
+{
+    unsigned i = log_n++ % LOG_N;
+    log_ring[i].t = get_ms_clock();
+    log_ring[i].code = (short)code;
+    log_ring[i].kind = kind;
+    log_ring[i].a = (signed char)a;
+    log_ring[i].b = (signed char)b;
+}
+
+static int log_line(char * out, int len, const struct log_ev * e)
+{
+    static const char * pk[] = { "-", "up", "down", "left", "right", "set", "close" };
+    const char * k = (e->a >= 0 && e->a <= 6) ? pk[(int)e->a] : (e->a == PK_CLOSE_NOW ? "close-now" : "?");
+    switch (e->kind)
+    {
+        case 'K': return snprintf(out, len, "%7u  button 0x%02x%s  -> %s\n", (unsigned)e->t, e->code & 0xffff,
+                                  e->b ? " (fake)" : "", "seen first by Mothlight");
+        case 'P': return snprintf(out, len, "%7u  portable key %d  -> panel %s, %s\n", (unsigned)e->t, e->code, k,
+                                  e->b ? "passed on to Canon" : "kept");
+        case 'O': return snprintf(out, len, "%7u  OPEN  theme %d, %d profiles\n", (unsigned)e->t, e->code, e->a);
+        case 'C': return snprintf(out, len, "%7u  CLOSE %s\n", (unsigned)e->t,
+                                  e->code >= 0 && e->code < (int)COUNT(close_why) ? close_why[e->code] : "?");
+        case 'R': return snprintf(out, len, "%7u  repaint (something drew over the panel)\n", (unsigned)e->t);
+        case 'T': return snprintf(out, len, "%7u  theme -> %d\n", (unsigned)e->t, e->code);
+        case 'A': return snprintf(out, len, "%7u  apply step %d (%d)\n", (unsigned)e->t, e->code, e->a);
+        case 'L': return snprintf(out, len, "%7u  LiveView %s\n", (unsigned)e->t, e->code ? "back" : "gone");
+    }
+    return 0;
+}
+
+static void log_flush(void)
+{
+    log_dirty = 0;
+    int n = log_n < LOG_N ? (int)log_n : LOG_N;
+    int cap = n * 72 + 160;
+    char * buf = malloc(cap);
+    if (!buf) return;
+    int len = snprintf(buf, cap, "Mothlight %s (%s) event log, newest last. Times in ms since power on.\n\n",
+                       MOTH_UI_VERSION, MOTH_UI_ENGINE);
+    for (unsigned i = log_n - n; i != log_n && len < cap - 80; i++)
+        len += log_line(buf + len, cap - len, &log_ring[i % LOG_N]);
+    FILE * f = FIO_CreateFile("ML/LOGS/MOTHLOG.TXT");
+    if (f)
+    {
+        FIO_WriteFile(f, buf, len);
+        FIO_CloseFile(f);
+    }
+    free(buf);
+}
 
 /* ---------------------------------------------------------------- small helpers */
 
@@ -164,6 +236,8 @@ static void fill_view(void)
     view.bpp = &bpp;
     view.bpp_learned_mask = cfg_learned;
     view.card_kBps = card_kBps(&view.card_auto);
+    int clock = menu_get_value_from_script("Debug", "SD Overclock");
+    view.sd_clock = clock == INT_MIN ? -1 : clock;
     view.free_MB = free_MB();
     view.battery = -1;
     view.engine = MOTH_UI_ENGINE[0] == 'c' ? "Crop Mood" : "ML dev";
@@ -258,6 +332,16 @@ static const char * apply_start(const struct rec_profile * p)
     return 0;
 }
 
+/* Crop Mood and set_lv_zoom block for up to a second while LiveView restarts. They run in
+   a helper task so the panel keeps repainting over whatever the restart draws. */
+static void apply_helper_task(void * arg)
+{
+    int idx = (int)(intptr_t)arg;
+    apply_err = apply_start(&profiles[idx]);
+    if (!apply_err) cfg_active = idx;       /* applied, even if the panel was closed meanwhile */
+    apply_helper = 2;
+}
+
 static void apply_poll(uint32_t now)
 {
     const struct rec_profile * p = &profiles[panel.applying];
@@ -265,20 +349,33 @@ static void apply_poll(uint32_t now)
 
     if (apply_phase == 1)
     {
-        const char * err = apply_start(p);
-        if (err)
+        if (apply_helper == 1) return;      /* the previous one is still finishing */
+        apply_helper = 1;
+        apply_err = 0;
+        apply_phase = 2;
+        apply_t0 = now;
+        mlog('A', 1, panel.applying, 0);
+        task_create("moth_apply", 0x1e, 0x1000, (void *) apply_helper_task, (void *)(intptr_t)panel.applying);
+        return;
+    }
+
+    if (apply_phase == 2)
+    {
+        if (apply_helper != 2) return;
+        apply_helper = 0;
+        mlog('A', 2, apply_err ? 1 : 0, 0);
+        if (apply_err)
         {
-            panel_apply_result(&panel, 0, err, now);
+            panel_apply_result(&panel, 0, apply_err, now);
             apply_phase = 0;
             return;
         }
-        cfg_active = panel.applying;
-        apply_phase = 2;
+        apply_phase = 3;
         apply_t0 = now;
         return;
     }
 
-    /* phase 2: Crop Mood refreshes LiveView on its own; wait for the new frame size */
+    /* phase 3: Crop Mood refreshes LiveView on its own; wait for the new frame size */
     if (now - apply_t0 < 600) return;
     if (p->mood == MOOD_OFF)
     {
@@ -286,6 +383,7 @@ static void apply_poll(uint32_t now)
         apply_phase = 0;
         return;
     }
+    if (!lv) return;
     read_live_format();
     int close = live_fmt.width > 0 && ABS(live_fmt.width - p->nominal.width) <= 32;
     if (close || now - apply_t0 > 4000)
@@ -353,6 +451,7 @@ static int overlay_begin(void)
     msleep(50);
     clrscr();
     key_head = key_tail = 0;                /* nothing from a previous session */
+    repaint_until = get_ms_clock() + 300;
     keys_released = 0;
     lv_lost_at = 0;
     last_frame_ms = get_ms_clock();
@@ -360,8 +459,10 @@ static int overlay_begin(void)
     return 1;
 }
 
-static void overlay_end(void)
+static void overlay_end(int why)
 {
+    mlog('C', why, 0, 0);
+    log_dirty = 1;
     overlay_active = 0;
     panel.state = PS_CLOSED;
     apply_phase = 0;                        /* an apply cut short is not resumed on the next open */
@@ -504,6 +605,8 @@ static void moth_task(void)
             {
                 fill_view();
                 panel_open(&panel, &view, get_ms_clock());
+                mlog('O', cfg_theme, profile_count, 0);
+                was_lv = lv;
             }
             open_request = 0;               /* an INFO that arrived while starting up is not a new request */
             opening = 0;
@@ -513,16 +616,19 @@ static void moth_task(void)
         if (overlay_active && keys_released)
         {
             /* the watchdog gave the buttons back while we were stuck: tidy up quietly */
-            overlay_end();
+            overlay_end(CLOSE_WATCHDOG);
             continue;
         }
 
         if (overlay_active)
         {
-            int k;
+            int k, closed = 0;
             while ((k = pop_key()) != PK_NONE)
             {
-                if (k == PK_CLOSE_NOW) { overlay_end(); break; }
+                /* ML and Canon may redraw around a key (on the EOS M, DOWN goes through ML's
+                   long-press check, which redraws the screen): repaint fully for a moment */
+                repaint_until = now + 300;
+                if (k == PK_CLOSE_NOW) { overlay_end(CLOSE_KEY_PASS); closed = 1; break; }
                 int act = panel_key(&panel, &view, k, now);
                 if (act == PA_APPLY) apply_phase = 1;
                 if (act == PA_THEME_NEXT || act == PA_THEME_PREV)
@@ -530,34 +636,43 @@ static void moth_task(void)
                     cfg_theme = (cfg_theme + (act == PA_THEME_NEXT ? 1 : THEME_COUNT - 1)) % THEME_COUNT;
                     view.theme = theme();
                     panel_theme_changed(&panel);
+                    mlog('T', cfg_theme, 0, 0);
                 }
             }
-            if (!overlay_active) continue;
-            if (apply_phase) apply_poll(now);
+            if (closed) continue;
+            if (apply_phase) { apply_poll(now); repaint_until = now + 300; }
 
             /* Something took the screen (ML menu, recording, photo mode, display off): give it
                back at once, without drawing again. LiveView itself may blink off while Crop Mood
                reconfigures, so only its long absence counts (longer while applying). */
-            int taken = gui_menu_shown() || RECORDING || !is_movie_mode() || !display_is_on();
+            if (!lv != !was_lv) { mlog('L', lv ? 1 : 0, 0, 0); was_lv = lv; }
+            int why = gui_menu_shown() ? CLOSE_MENU : RECORDING ? CLOSE_REC :
+                      !is_movie_mode() ? CLOSE_PHOTO : !display_is_on() ? CLOSE_DISPLAY : 0;
             if (!lv)
             {
                 if (!lv_lost_at) lv_lost_at = now ? now : 1;
-                if (now - lv_lost_at > (apply_phase ? 6000u : 700u)) taken = 1;
+                if (now - lv_lost_at > (apply_phase ? 6000u : 700u)) why = CLOSE_LV;
             }
             else lv_lost_at = 0;
-            if (taken) { overlay_end(); continue; }
+            if (why) { overlay_end(why); continue; }
 
             struct present out;
             last_frame_ms = now;
             view.active = cfg_active;
+            int was_done = panel.state == PS_DONE;
             int fl = panel_frame(&panel, &view, &back, now, &out);
             if (fl & PF_PRESENTED) present(&out);
-            if (panel_settled(&panel) && screen_was_disturbed())
-                present_full();
-            if (fl & PF_CLOSED) overlay_end();
-            msleep((fl & PF_ANIMATING) ? 20 : 50);
+            if (panel_settled(&panel))
+            {
+                if ((int32_t)(repaint_until - now) > 0) present_full();
+                else if (screen_was_disturbed()) { present_full(); mlog('R', 0, 0, 0); }
+            }
+            if (fl & PF_CLOSED) overlay_end(was_done ? CLOSE_DONE : CLOSE_KEY);
+            msleep(20);                     /* 50 Hz: a foreign redraw is gone within one frame */
             continue;
         }
+
+        if (log_dirty && !RECORDING && apply_helper != 1) log_flush();
 
         watch_recording(now);
         tally(now);
@@ -587,6 +702,7 @@ static unsigned int moth_keypress_cbr(unsigned int key)
     {
         struct key_route r = moth_route_key(key);
         if (r.panel_key != PK_NONE) push_key(r.panel_key);
+        mlog('P', key, r.panel_key, r.pass_to_canon);
         return r.pass_to_canon;
     }
 
@@ -620,6 +736,7 @@ static unsigned int moth_keypress_raw_cbr(unsigned int raw)
 {
     if (!overlay_active || keys_released) return 1;
     const struct event * e = (const struct event *) raw;
+    if (e && e->type == 0 && e->param >= 0) mlog('K', e->param, 0, IS_FAKE(e) ? 1 : 0);
     if (e && e->type == 0)
         switch (e->param)
         {
@@ -793,8 +910,8 @@ MODULE_INFO_START()
 MODULE_INFO_END()
 
 MODULE_CBRS_START()
+    MODULE_CBR(CBR_KEYPRESS_RAW, moth_keypress_raw_cbr, 0)    /* first: it logs every event */
     MODULE_CBR(CBR_KEYPRESS, moth_keypress_cbr, 0)
-    MODULE_CBR(CBR_KEYPRESS_RAW, moth_keypress_raw_cbr, 0)
 MODULE_CBRS_END()
 
 MODULE_CONFIGS_START()

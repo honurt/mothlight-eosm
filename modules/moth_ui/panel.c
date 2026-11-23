@@ -408,6 +408,15 @@ static void render_detail(struct panel * p, const struct panel_view * v, struct 
     ui_text(c, UF_MED, SW - DPAD, gy, verdict_color(v, vd), UA_RIGHT, verdict_word(vd, 1));
     int gw = SW - DPAD - (DX0 + DPAD);
     gfx_bar(c, DX0 + DPAD, gy + 32, gw, 10, tween_value(&p->bar, now), 128, C_TRACK, verdict_color(v, vd), TH->burst, C_DIM);
+    if (v->card_auto && v->sd_clock == 0 && vd != BUDGET_CONTINUOUS)
+    {
+        /* the usual reason for BURST everywhere: the EOS M's card reader runs at its stock
+           clock (~38 MB/s), whatever the card's label says. Say where the fix is. */
+        snprintf(buf, sizeof(buf), "Card ~%d MB/s: stock SD clock", v->card_kBps / 1000);
+        ui_text_fit(c, UF_MONO, x, gy + 50, C_DIM, UA_LEFT, buf, SW - DPAD - x);
+        ui_text_fit(c, UF_MONO, x, gy + 74, C_TEXT, UA_LEFT, "Faster: Debug > SD Overclock", SW - DPAD - x);
+        return;
+    }
     snprintf(buf, sizeof(buf), "Card %s%d MB/s%s", v->card_auto ? "~" : "", v->card_kBps / 1000,
              v->card_auto ? " (est.)" : "");
     ui_text(c, UF_MONO, x, gy + 50, C_DIM, UA_LEFT, buf);
@@ -596,6 +605,10 @@ int panel_key(struct panel * p, const struct panel_view * v, int key, uint32_t n
                     panel_close(p, v, now);
                     return PA_CLOSED_BY_USER;
             }
+            return PA_NONE;
+        case PS_APPLYING:
+            /* the apply runs in its own task and finishes even if the panel closes */
+            if (key == PK_CLOSE) { panel_close(p, v, now); return PA_CLOSED_BY_USER; }
             return PA_NONE;
         default:
             return PA_NONE;

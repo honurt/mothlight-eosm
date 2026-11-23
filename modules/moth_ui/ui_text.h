@@ -40,6 +40,8 @@ int  ui_text_fit(struct canvas * c, int font, int x, int y, uint8_t fg, int alig
 #ifdef MOTH_SIM
 extern int ui_text_overflows;
 extern char ui_text_overflow_last[96];
+extern char ui_text_drawn[16384];
+void ui_text_drawn_reset(void);
 #endif
 
 #endif

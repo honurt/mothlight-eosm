@@ -81,10 +81,16 @@ int  is_camera(const char * model, const char * fw);
 
 struct font { const void * bitmap; };
 extern struct font font_dynamic[];
-void task_create(const char * name, int prio, int stack, void (*fn)(void), void * arg);
+void task_create(const char * name, int prio, int stack, void * fn, void * arg);
 #define CBR_RET_ERROR 1
 
 struct event { int type; int param; void * obj; int arg; };
+#define FAKE_BTN 0x7E57
+#define IS_FAKE(event) ((event)->arg == FAKE_BTN)
+
+FILE * FIO_CreateFile(const char * name);
+int  FIO_WriteFile(FILE * f, const void * p, size_t n);
+void FIO_CloseFile(FILE * f);
 
 /* module glue: expose entry points to the harness */
 #define MODULE_INFO_START()

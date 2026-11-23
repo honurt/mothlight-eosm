@@ -45,7 +45,7 @@ static int failures;
 
 /* counters the scenarios look at */
 static int canon_got[256];                  /* Canon button codes received */
-static int canon_redraws, canon_redraws_open;
+static int canon_redraws, canon_redraws_open, canon_key_redraws_open;
 static long heap_live, heap_peak;
 static int fail_big_malloc;                 /* fail the next allocation >= 100 kB */
 static int notify_count;
@@ -92,55 +92,78 @@ static int raw_w, raw_h;
 
 static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
-static int turn;                            /* 0 world/GUI, 1 module task */
-static uint32_t task_wake;
-static int task_running, task_done, task_blocked;
-static void (*task_fn)(void);
+#define MAX_TASKS 8
+struct ctask { void (*fn)(void *); void * arg; uint32_t wake; int done, blocked; const char * name; };
+static struct ctask tasks[MAX_TASKS];
+static int ntasks;
+static int turn = -1;                       /* -1: world/GUI; else the task running */
+static __thread int my_task = -1;
+static int task_running;
 
 static void post_frame_checks(void);
 
 static void yield_to_world(uint32_t wake, int blocked)
 {
+    int me = my_task;
     pthread_mutex_lock(&mx);
-    task_wake = wake; task_blocked = blocked;
-    turn = 0; pthread_cond_broadcast(&cv);
-    while (turn != 1) pthread_cond_wait(&cv, &mx);
+    tasks[me].wake = wake; tasks[me].blocked = blocked;
+    turn = -1; pthread_cond_broadcast(&cv);
+    while (turn != me) pthread_cond_wait(&cv, &mx);
     pthread_mutex_unlock(&mx);
 }
 
+static void cam_block(int ms);
+static int ui_stall_once;                   /* the UI task hangs this long, once (watchdog tests) */
 void msleep(int ms)
 {
-    post_frame_checks();                    /* the task just finished a frame */
+    if (my_task == 0) post_frame_checks();  /* the UI task just finished a frame */
+    if (my_task == 0 && ui_stall_once) { int st = ui_stall_once; ui_stall_once = 0; cam_block(st); }
     yield_to_world(now_ms + (ms > 0 ? ms : 1), 0);
 }
 
-/* the task is inside a slow camera call: time passes, the GUI keeps running */
+/* a task is inside a slow camera call: time passes, the GUI and other tasks keep running */
 static void cam_block(int ms) { yield_to_world(now_ms + ms, 1); }
 
+struct start { int id; };
 static void * task_thread(void * arg)
 {
+    int id = (int)(intptr_t)arg;
+    my_task = id;
     pthread_mutex_lock(&mx);
-    while (turn != 1) pthread_cond_wait(&cv, &mx);
+    while (turn != id) pthread_cond_wait(&cv, &mx);
     pthread_mutex_unlock(&mx);
-    task_fn();
+    tasks[id].fn(tasks[id].arg);
     pthread_mutex_lock(&mx);
-    task_done = 1; turn = 0; pthread_cond_broadcast(&cv);
+    tasks[id].done = 1; turn = -1; pthread_cond_broadcast(&cv);
     pthread_mutex_unlock(&mx);
     return 0;
 }
 
-void task_create(const char * name, int prio, int stack, void (*fn)(void), void * arg)
+void task_create(const char * name, int prio, int stack, void * fn, void * arg)
 {
-    task_fn = fn;
+    int id = -1;
+    for (int i = 1; i < ntasks; i++) if (tasks[i].done) { id = i; break; }   /* finished tasks free their slot */
+    if (id < 0)
+    {
+        if (ntasks >= MAX_TASKS) { fprintf(stderr, "too many tasks\n"); abort(); }
+        id = ntasks++;
+    }
+    memset(&tasks[id], 0, sizeof(tasks[id]));
+    tasks[id].fn = (void (*)(void *)) fn;
+    tasks[id].arg = arg;
+    tasks[id].wake = now_ms;                /* runs at the next tick */
+    tasks[id].name = name;
     pthread_t th;
-    pthread_create(&th, 0, task_thread, 0);
+    pthread_create(&th, 0, task_thread, (void *)(intptr_t)id);
     pthread_detach(th);
     task_running = 1;
 }
 
 static void world_tick(void);
 
-/* advance the world; give the task its turns */
+static void check_visible(void);
+
+/* advance the world; give each task its turns */
 static void run_for(int ms)
 {
     uint32_t end = now_ms + ms;
@@ -148,15 +171,66 @@ static void run_for(int ms)
     {
         now_ms += 5;
         world_tick();
-        if (task_running && !task_done && now_ms >= task_wake)
+        for (int i = 0; i < ntasks; i++)
         {
+            if (tasks[i].done || now_ms < tasks[i].wake) continue;
             pthread_mutex_lock(&mx);
-            turn = 1; pthread_cond_broadcast(&cv);
-            while (turn != 0) pthread_cond_wait(&cv, &mx);
+            turn = i; pthread_cond_broadcast(&cv);
+            while (turn != -1) pthread_cond_wait(&cv, &mx);
             pthread_mutex_unlock(&mx);
         }
+        check_visible();
     }
 }
+
+/* ML's long-press ring (x 655-685, y 328-358) is ML's own UI while DOWN is held: allowed there */
+static int ring_active;
+static int row_differs(int y)
+{
+    const uint8_t * a = bmp + y * BMPPITCH, * b = back.px + y * back.pitch;
+    if (ring_active && y >= 328 && y < 358)
+        return memcmp(a, b, 655) || memcmp(a + 685, b + 685, UI_W - 685);
+    return memcmp(a, b, UI_W) != 0;
+}
+
+/* What the user sees: while the panel is fully open, anything else on the screen may last
+   at most one or two LCD frames. This is the "black flash" / "goes to shooting and back". */
+#define MAX_OVERDRAW_MS 45
+static uint32_t overdrawn_since;
+static int worst_overdraw;
+static void check_visible(void)
+{
+    /* a stalled panel task cannot repaint (that is what the watchdog is for) */
+    if (!(overlay_active && back_buf && panel_settled(&panel)) || tasks[0].blocked || keys_released)
+    { overdrawn_since = 0; return; }
+    int diff = 0;
+    for (int y = 1; y < UI_H && !diff; y += 6) diff = row_differs(y);
+    if (!diff) { overdrawn_since = 0; return; }
+    if (!overdrawn_since) overdrawn_since = now_ms;
+    int d = now_ms - overdrawn_since;
+    if (d > worst_overdraw) worst_overdraw = d;
+    if (d == MAX_OVERDRAW_MS + 5) FAIL("the panel was overdrawn for more than %d ms (visible flash)", MAX_OVERDRAW_MS);
+}
+
+/* the card: files the module writes */
+static char logfile[65536];
+static int logfile_len, logfile_writes, logfile_writes_recording;
+static struct { int open; } the_file;
+FILE * FIO_CreateFile(const char * name)
+{
+    if (strcmp(name, "ML/LOGS/MOTHLOG.TXT")) { FAIL("unexpected file %s", name); return 0; }
+    logfile_len = 0; logfile_writes++;
+    if (cam.recording) logfile_writes_recording++;
+    the_file.open = 1;
+    return (FILE *) &the_file;
+}
+int FIO_WriteFile(FILE * f, const void * p, size_t n)
+{
+    if (n > sizeof(logfile) - logfile_len) n = sizeof(logfile) - logfile_len;
+    memcpy(logfile + logfile_len, p, n); logfile_len += n; logfile[logfile_len < (int)sizeof(logfile) ? logfile_len : (int)sizeof(logfile) - 1] = 0;
+    return n;
+}
+void FIO_CloseFile(FILE * f) { the_file.open = 0; }
 
 /* ---------------------------------------------------------------- Canon */
 
@@ -173,6 +247,7 @@ static void canon_redraw_screen(void)
 static void canon_receive(int code)
 {
     canon_got[code & 0xff]++;
+    if (overlay_active && code != 93 && code != 91 && code != 97 && code != 105) canon_key_redraws_open++;
     if (!cam.lv_on || cam.playback) return;
     switch (code)
     {
@@ -220,21 +295,51 @@ static int portable(int canon)
 }
 
 /* one button event through ML: core first (two-finger tap opens ML's menu), then modules */
-static void gui_event(int canon)
+static void gui_event_x(int canon, int fake)
 {
     if (canon == K_TOUCH2 && cam.lv_on && !cam.menu_shown) { cam.menu_shown = 1; return; }
     if (cam.menu_shown) return;             /* ML's menu eats everything while it is open */
 
     static struct event ev;                 /* static: low address, like the camera's 32-bit pointers */
-    ev.type = 0; ev.param = canon; ev.obj = 0; ev.arg = 0;
-    if (!cam_CBR_KEYPRESS(portable(canon))) return;
+    ev.type = 0; ev.param = canon; ev.obj = 0; ev.arg = fake ? FAKE_BTN : 0;
+    /* module.c calls a module's handlers in the order the module declares them:
+       moth_ui declares the raw one first (it logs every event) */
     if (!cam_CBR_KEYPRESS_RAW((unsigned int)(uintptr_t)&ev)) return;
+    if (!cam_CBR_KEYPRESS(portable(canon))) return;
     canon_receive(canon);
+}
+static void gui_event(int canon) { gui_event_x(canon, 0); }
+
+/* EOS M: ML's core takes DOWN before any module (a 0.5 s hold opens ML's menu; the camera has
+   no trash key). It draws a progress ring while held; on a short press it calls redraw() --
+   Canon repaints its screen -- and then sends a fake DOWN press and release to the modules. */
+static int ml_longpress_down = 1;
+static int ml_redraws;
+static void press_down_eosm(int hold_ms)
+{
+    if (!ml_longpress_down || !cam.lv_on || cam.menu_shown || cam.playback)
+    {
+        gui_event(K_DOWN); run_for(hold_ms); gui_event(K_DOWN_UP); return;
+    }
+    int t = 0;
+    ring_active = 1;
+    do
+    {
+        for (int y = 328; y < 358; y++) memset(bmp + y * BMPPITCH + 655, 0x0E, 30);   /* the ring */
+        run_for(20); t += 20;
+    } while (t < hold_ms && t < 500);
+    if (t >= 500) { cam.menu_shown = 1; ring_active = 0; return; }  /* long press: ML menu */
+    run_for(10);
+    canon_redraw_screen(); ml_redraws++;                            /* redraw() erases the ring */
+    ring_active = 0;
+    gui_event_x(K_DOWN, 1);
+    gui_event_x(K_DOWN_UP, 1);
 }
 
 /* a press and its release, the way the EOS M sends them */
 static void tap(int canon, int hold_ms)
 {
+    if (canon == K_DOWN) { press_down_eosm(hold_ms); return; }
     gui_event(canon);
     run_for(hold_ms);
     switch (canon)
@@ -281,6 +386,7 @@ static void world_tick(void)
 static void lv_refresh(void)
 {
     if (!cam.lv_on) return;
+    canon_redraw_screen();                  /* LiveView going down redraws Canon's screen */
     cam.lv_on = 0;
     lv_back_at = now_ms + lv_pause_ms;
 }
@@ -290,7 +396,7 @@ static void lv_refresh(void)
 int is_movie_mode(void) { return cam.movie; }
 int gui_menu_shown(void) { return cam.menu_shown; }
 int display_is_on(void) { return cam.display_on; }
-void set_lv_zoom(int z) { cam.dispsize = z; lv_refresh(); if (stall_zoom_ms) cam_block(stall_zoom_ms); }
+void set_lv_zoom(int z) { cam.dispsize = z; lv_refresh(); cam_block(stall_zoom_ms ? stall_zoom_ms : 600); }
 int fps_get_current_x1000(void) { return 23976; }
 void gui_stop_menu(void) { cam.menu_shown = 0; }
 
@@ -416,7 +522,7 @@ static void post_frame_checks(void)
     if (settled && back_buf)
     {
         for (int y = 0; y < UI_H; y++)
-            if (memcmp(bmp + y * BMPPITCH, back.px + y * back.pitch, UI_W))
+            if (row_differs(y))
             {
                 settled_mismatch++;
                 int x = 0; while (x < UI_W && bmp[y * BMPPITCH + x] == back.px[y * back.pitch + x]) x++;
@@ -485,15 +591,15 @@ static void s_basic_navigation(void)
 {
     boot(); open_panel();
     int sel0 = panel.sel;
-    int r0 = canon_redraws_open;
+    int r0 = canon_key_redraws_open;
     for (int i = 0; i < 3; i++) { tap(K_DOWN, 80); run_for(120); }
     EXPECT(panel.sel == sel0 + 3, "DOWN x3 moved selection %d -> %d", sel0, panel.sel);
     tap(K_UP, 80); run_for(200);
     EXPECT(panel.sel == sel0 + 2, "UP did not move selection back");
     tap(K_WR, 0); tap(K_WR, 0); run_for(200);
     EXPECT(panel.sel == sel0 + 4, "rear dial did not scroll");
-    EXPECT(canon_redraws_open == r0, "Canon redrew over the panel %d times while navigating (the black flash)",
-           canon_redraws_open - r0);
+    EXPECT(canon_key_redraws_open == r0, "%d navigation keys leaked to Canon, which redraws on them (the black flash)",
+           canon_key_redraws_open - r0);
     EXPECT(!canon_got[K_DOWN] && !canon_got[K_DOWN_UP] && !canon_got[K_UP_UP], "navigation keys leaked to Canon");
     EXPECT(panel_open_now(), "panel closed while navigating");
     finish();
@@ -511,6 +617,101 @@ static void s_double_info(void)
     close_panel();
     run_for(1500);
     EXPECT(!overlay_active, "double INFO: the panel reopened by itself after closing");
+    finish();
+}
+
+
+static int find_profile(int mood);
+static void select_profile(int idx);
+
+static int screen_says(const char * text)
+{
+    ui_text_drawn_reset();
+    panel.full_redraw = 1;
+    run_for(60);
+    return strstr(ui_text_drawn, text) != 0;
+}
+
+static void s_down_eosm(void)
+{
+    boot(); open_panel();
+    int s0 = panel.sel;
+    for (int i = 0; i < 5; i++) { tap(K_DOWN, 60 + i * 40); run_for(150); }
+    EXPECT(ml_redraws == 5, "ML's long-press check ran %d times", ml_redraws);
+    EXPECT(panel.sel == (s0 + 5) % profile_count, "DOWN x5 (through ML's long-press check) moved %d -> %d", s0, panel.sel);
+    EXPECT(panel_open_now(), "panel closed after DOWN");
+    printf("    worst overdraw after DOWN: %d ms\n", worst_overdraw);
+    /* holding DOWN opens ML's menu: the panel must give way */
+    tap(K_DOWN, 700);
+    run_for(100);
+    EXPECT(!overlay_active, "panel still drawing over ML's menu after a long DOWN");
+    cam.menu_shown = 0;
+    finish();
+}
+
+static void s_apply_no_flash(void)
+{
+    boot(); open_panel();
+    int idx = find_profile(MOOD_1X1);
+    select_profile(idx);
+    worst_overdraw = 0;
+    tap(K_SET, 40);
+    run_for(1500);
+    EXPECT(overlay_active, "panel closed during apply");
+    EXPECT(strstr(panel.toast, "Ready") != 0, "toast: \"%s\"", panel.toast);
+    printf("    worst overdraw while applying: %d ms\n", worst_overdraw);
+    finish();
+}
+
+static void s_close_mid_apply(void)
+{
+    boot(); open_panel();
+    int a = find_profile(MOOD_1X1);
+    select_profile(a);
+    tap(K_SET, 30); run_for(100);
+    tap(K_INFO, 0); run_for(1500);          /* closed while the helper is still applying */
+    EXPECT(!overlay_active, "did not close mid-apply");
+    EXPECT(cfg_active == a, "an apply that finished after closing was not recorded (active %d)", cfg_active);
+    open_panel();
+    int b = (a + 1) % profile_count;
+    select_profile(b);
+    tap(K_SET, 30); run_for(1800);
+    EXPECT(cfg_active == b, "second apply after closing mid-apply did not run (active %d)", cfg_active);
+    finish();
+}
+
+static void s_sd_clock_hint(void)
+{
+    boot();
+    find_menu("Debug", "SD Overclock")->value = 0;
+    open_panel();
+    select_profile(find_profile(MOOD_1X1));
+    EXPECT(screen_says("Debug > SD Overclock"), "no SD Overclock hint with the stock clock:\n%s", ui_text_drawn);
+    close_panel();
+    find_menu("Debug", "SD Overclock")->value = 1;
+    open_panel();
+    select_profile(find_profile(MOOD_1X1));
+    EXPECT(!screen_says("SD Overclock"), "SD Overclock hint shown although it is on");
+    finish();
+}
+
+static void s_event_log(void)
+{
+    boot(); open_panel();
+    tap(K_LEFT, 40); tap(K_RIGHT, 40); tap(K_DOWN, 60); tap(K_UP, 40);
+    close_panel();
+    run_for(500);
+    EXPECT(logfile_writes == 1, "log written %d times", logfile_writes);
+    EXPECT(strstr(logfile, "OPEN") && strstr(logfile, "button 0x28") && strstr(logfile, "button 0x26")
+           && strstr(logfile, "(fake)") && strstr(logfile, "CLOSE closed by a key"), "log content:\n%s", logfile);
+    /* never written while recording */
+    open_panel();
+    tap(K_REC, 0);
+    run_for(2000);
+    EXPECT(logfile_writes_recording == 0, "log written while recording");
+    cam.recording = 0;
+    run_for(500);
+    EXPECT(logfile_writes == 2 && strstr(logfile, "CLOSE closed by REC/PLAY/shutter"), "log after REC:\n%s", logfile);
     finish();
 }
 
@@ -635,8 +836,12 @@ static int find_profile(int mood)
 
 static void select_profile(int idx)
 {
-    while (panel.sel < idx) { tap(K_DOWN, 30); run_for(60); }
-    while (panel.sel > idx) { tap(K_UP, 30); run_for(60); }
+    for (int i = 0; i < 40 && panel.sel != idx && panel_open_now(); i++)
+    {
+        tap(panel.sel < idx ? K_DOWN : K_UP, 30);
+        run_for(60);
+    }
+    EXPECT(panel.sel == idx, "could not select profile %d (sel %d, panel %s)", idx, panel.sel, panel_open_now() ? "open" : "closed");
     run_for(300);
 }
 
@@ -704,9 +909,8 @@ static void s_apply_modules_missing(void)
 static void s_stalled_task_watchdog(void)
 {
     boot(); open_panel();
-    stall_zoom_ms = 3500;                   /* the task hangs inside set_lv_zoom */
     select_profile(find_profile(MOOD_1X1));
-    tap(K_SET, 40);
+    ui_stall_once = 3500;                   /* the panel's task hangs */
     run_for(2600);
     int before = canon_got[K_HALF];
     tap(K_HALF, 0);
@@ -938,7 +1142,8 @@ static void s_soak(void)
         else if (r < 85) { cam.recording = 0; }
         else if (r < 87) { cam.playback = 0; cam.lv_on = 1; cam.canon_menu = 0; }
         else if (r < 88) { stall_zoom_ms = 2500; }
-        else if (r < 90) { stall_zoom_ms = 0; }
+        else if (r < 89) { stall_zoom_ms = 0; }
+        else if (r < 90) { ui_stall_once = 1000 + rand() % 2500; }
         else if (r < 91) { canon_periodic_ms = canon_periodic_ms ? 0 : 900; }
         run_for(rand() % 150);
         if (overlay_active) opens++;
@@ -1017,6 +1222,11 @@ struct sc { const char * name; void (*fn)(void); };
 static const struct sc all[] = {
     { "basic navigation (no flash, no leak)", s_basic_navigation },
     { "double INFO during start-up (no ghost reopen)", s_double_info },
+    { "DOWN through ML's EOS M long-press check (flash, long hold)", s_down_eosm },
+    { "apply without visible flash (helper task)", s_apply_no_flash },
+    { "close while applying, then apply again", s_close_mid_apply },
+    { "SD Overclock hint when the card is the limit", s_sd_clock_hint },
+    { "event log on the card (never while recording)", s_event_log },
     { "all themes, both directions", s_themes_all },
     { "600 random keys incl. touch and unknown events", s_key_mash },
     { "keys during open/close animations", s_keys_during_animations },
@@ -1051,26 +1261,56 @@ extern void camsim_load_fonts(const char * dir);
 int main(int argc, char ** argv)
 {
     const char * only = getenv("ONLY");
-    int failed = 0, ran = 0;
-    for (int i = 0; i < COUNT(all); i++)
+    int jobs = getenv("JOBS") ? atoi(getenv("JOBS")) : 2;
+    if (jobs < 1) jobs = 1;
+    int n = COUNT(all), failed = 0, ran = 0;
+    pid_t pid[COUNT(all)] = { 0 };
+    int status[COUNT(all)];
+    char logs[COUNT(all)][64];
+    int next = 0, running = 0, done_upto = 0;
+    while (done_upto < n)
     {
-        if (only && !strstr(all[i].name, only)) continue;
-        fflush(stdout);
-        pid_t pid = fork();
-        if (pid == 0)
+        while (running < jobs && next < n)
         {
-            if (argc > 1) camsim_load_fonts(argv[1]);
-            if (argc > 2) dump_dir = argv[2];
-            scenario = all[i].name;
-            all[i].fn();
+            int i = next++;
+            if (only && !strstr(all[i].name, only)) { pid[i] = -1; continue; }
+            snprintf(logs[i], sizeof(logs[i]), "/tmp/camsim.%d.%d.log", (int)getpid(), i);
             fflush(stdout);
-            _exit(failures ? 1 : 0);
+            pid[i] = fork();
+            if (pid[i] == 0)
+            {
+                FILE * f = freopen(logs[i], "w", stdout); (void)f;
+                dup2(fileno(stdout), 2);
+                if (argc > 1) camsim_load_fonts(argv[1]);
+                if (argc > 2) dump_dir = argv[2];
+                scenario = all[i].name;
+                all[i].fn();
+                fflush(stdout);
+                _exit(failures ? 1 : 0);
+            }
+            running++;
         }
-        int st; waitpid(pid, &st, 0);
-        int ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
-        printf("%s  %s%s\n", ok ? "pass" : "FAIL", all[i].name,
-               WIFSIGNALED(st) ? "  (crashed)" : "");
-        failed += !ok; ran++;
+        int st; pid_t p = wait(&st);
+        if (p > 0)
+        {
+            for (int i = 0; i < n; i++) if (pid[i] == p) { status[i] = st; pid[i] = -2; }
+            running--;
+        }
+        /* print finished scenarios in order */
+        while (done_upto < n && (pid[done_upto] == -1 || pid[done_upto] == -2))
+        {
+            int i = done_upto++;
+            if (pid[i] == -1) continue;
+            FILE * f = fopen(logs[i], "r");
+            char line[512];
+            while (f && fgets(line, sizeof(line), f))
+                if (!strstr(line, "    #") && !strstr(line, "not understood")) fputs(line, stdout);
+            if (f) fclose(f);
+            unlink(logs[i]);
+            int ok = WIFEXITED(status[i]) && WEXITSTATUS(status[i]) == 0;
+            printf("%s  %s%s\n", ok ? "pass" : "FAIL", all[i].name, WIFSIGNALED(status[i]) ? "  (crashed)" : "");
+            failed += !ok; ran++;
+        }
     }
     printf("\n%d of %d scenarios passed\n", ran - failed, ran);
     return failed != 0;
