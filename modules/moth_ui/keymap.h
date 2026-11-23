@@ -32,8 +32,12 @@ static inline struct key_route moth_route_key(int key)
 
         case MODULE_KEY_TOUCH_1_FINGER: case MODULE_KEY_UNTOUCH_1_FINGER:
             r.pass_to_canon = 0; break;                            /* stray touch: ignore */
+        case MODULE_KEY_UNPRESS_SET:
+            r.pass_to_canon = 0; break;    /* Canon redraws its LiveView screen on it */
         default:
-            break;    /* releases, untranslated (0) and housekeeping events: never close */
+            break;    /* untranslated (0) and housekeeping events: never close, pass on.
+                         The EOS M D-pad releases also arrive as 0; moth_ui.c swallows those
+                         in its raw handler, which still sees the real button code. */
     }
     return r;
 }

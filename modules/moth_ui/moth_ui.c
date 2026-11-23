@@ -38,6 +38,7 @@
 #include "version.h"
 #include "panel.h"
 #include "keymap.h"
+#include "repair.h"
 #include "ui_text.h"
 #include "budget.h"
 #include "profiles.h"
@@ -309,6 +310,25 @@ static void present(const struct present * o)
         }
 }
 
+/* Anything else that draws on the screen while the panel is up (Canon refreshing its
+   LiveView overlay, an ML notification) would leave holes, because frames only copy the
+   rows that changed. Probe a spread of pixels against the back buffer every frame and
+   repaint the whole screen when they disagree. ~100 byte reads, i.e. free. */
+static int screen_was_disturbed(void)
+{
+    uint8_t * front = bmp_vram_real();
+    if (!front || !back_buf) return 0;
+    return moth_screen_differs(front, BMPPITCH, back.px, back.pitch, UI_W);
+}
+
+static void present_full(void)
+{
+    uint8_t * front = bmp_vram_real();
+    if (!front || !back_buf) return;
+    for (int y = 0; y < UI_H; y++)
+        memcpy(front + y * BMPPITCH, back.px + y * back.pitch, UI_W);
+}
+
 static int overlay_begin(void)
 {
     /* the panel's own full-screen buffer (338 KB), allocated only while the panel is open */
@@ -496,6 +516,9 @@ static void moth_task(void)
             view.active = cfg_active;
             int fl = panel_frame(&panel, &view, &back, now, &out);
             if (fl & PF_PRESENTED) present(&out);
+            if ((panel.state == PS_OPEN || panel.state == PS_APPLYING || panel.state == PS_DONE)
+                && screen_was_disturbed())
+                present_full();
             if (fl & PF_CLOSED) overlay_end();
             msleep((fl & PF_ANIMATING) ? 20 : 50);
             continue;
@@ -538,6 +561,28 @@ static unsigned int moth_keypress_cbr(unsigned int key)
         open_request = 1;
         return 0;
     }
+    return 1;
+}
+
+/* EOS M D-pad release codes (platform/EOSM.202/gui.h). ML has no portable name for them,
+   so the portable handler above only sees key 0. Passed on, they make Canon redraw its
+   LiveView screen over the panel (a black flash, and wiped bars). Swallow them while open. */
+#define EOSM_UNPRESS_UP    0x2b
+#define EOSM_UNPRESS_RIGHT 0x27
+#define EOSM_UNPRESS_LEFT  0x29
+#define EOSM_UNPRESS_DOWN  0x2d
+
+static unsigned int moth_keypress_raw_cbr(unsigned int raw)
+{
+    if (!overlay_active) return 1;
+    const struct event * e = (const struct event *) raw;
+    if (e && e->type == 0)
+        switch (e->param)
+        {
+            case EOSM_UNPRESS_UP: case EOSM_UNPRESS_RIGHT:
+            case EOSM_UNPRESS_LEFT: case EOSM_UNPRESS_DOWN:
+                return 0;
+        }
     return 1;
 }
 
@@ -705,6 +750,7 @@ MODULE_INFO_END()
 
 MODULE_CBRS_START()
     MODULE_CBR(CBR_KEYPRESS, moth_keypress_cbr, 0)
+    MODULE_CBR(CBR_KEYPRESS_RAW, moth_keypress_raw_cbr, 0)
 MODULE_CBRS_END()
 
 MODULE_CONFIGS_START()

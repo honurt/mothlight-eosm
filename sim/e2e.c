@@ -14,6 +14,7 @@
 #include <string.h>
 #include "simlib.h"
 #include "../modules/moth_ui/panel.h"
+#include "../modules/moth_ui/repair.h"
 
 static uint8_t back[UI_W * UI_H];
 static struct canvas screen = { front, UI_W, 0, 0, UI_W, UI_H, 0, 0, UI_W, UI_H };
@@ -117,9 +118,11 @@ int main(int argc, char ** argv)
     struct canvas c = { back, UI_W, 0, 0, UI_W, UI_H, 0, 0, UI_W, UI_H };
     int panel_up = 0, si = 0, applied = 0, learned = 0, max_rows = 0, frames = 0, drawn = 0;
     long bytes = 0;
+    int repairs = 0, repaired_ok_once = 0;
 
     for (int t = 0, n = 0; t <= t_end; t += 40, n++)
     {
+        int key_this_frame = 0;
         while (script[si].what && script[si].t <= t)
         {
             fprintf(story, "%5d ms  frame %3d  %s\n", t, n, script[si].what);
@@ -127,6 +130,7 @@ int main(int argc, char ** argv)
             else
             {
                 int act = panel_key(&p, &view, script[si].key, t);
+                key_this_frame = 1;
                 if (act == PA_THEME_NEXT || act == PA_THEME_PREV)
                 {
                     theme = (theme + (act == PA_THEME_NEXT ? 1 : THEME_COUNT - 1)) % THEME_COUNT;
@@ -190,6 +194,25 @@ int main(int argc, char ** argv)
                     if (out.op[i].clear) memset(front + y * UI_W + out.x0, 0, out.x1 - out.x0);
                     else memcpy(front + y * UI_W + out.x0, back + y * UI_W + out.x0, out.x1 - out.x0);
                 }
+            int settled = p.state == PS_OPEN || p.state == PS_APPLYING || p.state == PS_DONE;
+            /* the camera bug this guards: Canon redrew its LiveView screen over the panel
+               after a key, wiping the top and bottom bars. Do that here after every key. */
+            if (settled && key_this_frame)
+            {
+                memset(front, 0, (size_t) UI_W * 52);
+                memset(front + (UI_H - 42) * UI_W, 0, (size_t) UI_W * 42);
+            }
+            if (settled && moth_screen_differs(front, UI_W, back, UI_W, UI_W))
+            {
+                memcpy(front, back, sizeof(front));
+                repairs++;
+            }
+            if (settled && memcmp(front, back, sizeof(front)))
+            {
+                fprintf(stderr, "FAIL frame %d: screen differs from the panel after repair\n", n);
+                return 1;
+            }
+            if (settled && !key_this_frame && !repaired_ok_once && repairs) repaired_ok_once = 1;
             if (rows > max_rows) max_rows = rows;
             bytes += (long)rows * UI_W;
             frames++;
@@ -204,7 +227,10 @@ int main(int argc, char ** argv)
     }
     fprintf(story, "\npanel frames: %d, frames that drew: %d, average %ld bytes/frame copied to the screen, peak %d rows\n",
             frames, drawn, bytes / (frames ? frames : 1), max_rows);
+    fprintf(story, "screen wiped after every key and repaired %d times; screen matched the panel on every settled frame\n", repairs);
     fclose(story);
+    if (!repairs) { fprintf(stderr, "FAIL: the wipe test never ran\n"); return 1; }
+    printf("repairs: %d, settled frames all match\n", repairs);
     printf("done: %d panel frames, %d drew, avg %ld B/frame\n", frames, drawn, bytes / (frames ? frames : 1));
     return 0;
 }
