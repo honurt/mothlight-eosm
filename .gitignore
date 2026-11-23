@@ -7,3 +7,5 @@
 /sim/test_budget
 *.o
 .DS_Store
+sim/test_keys
+sim/module_keys.h

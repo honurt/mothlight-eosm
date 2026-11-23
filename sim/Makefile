@@ -9,7 +9,7 @@ SRC     = $(UI)/themes.c $(UI)/panel.c $(UI)/ui_gfx.c $(UI)/ui_text.c $(UI)/budg
 FONTS  ?= $(firstword $(wildcard ../work/cropmood/data/fonts ../work/upstream/data/fonts))
 OUT    ?= ../out/preview
 
-all: sim e2e test_budget
+all: sim e2e test_budget test_keys
 
 sim: sim.c simlib.c simlib.h $(SRC) $(UI)/*.h
 	$(CC) $(CFLAGS) -o $@ sim.c simlib.c $(SRC)
@@ -20,8 +20,18 @@ e2e: e2e.c simlib.c simlib.h $(SRC) $(UI)/*.h
 test_budget: ../tests/test_budget.c $(UI)/budget.c $(UI)/profiles.c $(UI)/*.h
 	$(CC) $(CFLAGS) -o $@ ../tests/test_budget.c $(UI)/budget.c $(UI)/profiles.c
 
-test: test_budget
+MODULE_H ?= $(firstword $(wildcard ../work/cropmood/src/module.h ../work/upstream/src/module.h))
+
+module_keys.h: $(MODULE_H)
+	@test -n "$(MODULE_H)" || { echo "no engine: run scripts/fetch.sh first"; exit 1; }
+	grep '^#define MODULE_KEY_' $(MODULE_H) > $@
+
+test_keys: ../tests/test_keys.c $(UI)/keymap.h $(UI)/panel.h module_keys.h
+	$(CC) $(CFLAGS) -I. -o $@ ../tests/test_keys.c
+
+test: test_budget test_keys
 	./test_budget
+	./test_keys
 
 preview: sim
 	@test -n "$(FONTS)" || { echo "no fonts: run scripts/fetch.sh first"; exit 1; }
@@ -38,4 +48,4 @@ e2e-video: e2e
 	python3 render_e2e.py $(OUT)/e2e $(OUT)
 
 clean:
-	rm -f sim e2e test_budget
+	rm -f sim e2e test_budget test_keys module_keys.h

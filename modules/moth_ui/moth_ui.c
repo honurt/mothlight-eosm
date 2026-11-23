@@ -37,6 +37,7 @@
 
 #include "version.h"
 #include "panel.h"
+#include "keymap.h"
 #include "ui_text.h"
 #include "budget.h"
 #include "profiles.h"
@@ -525,23 +526,9 @@ static unsigned int moth_keypress_cbr(unsigned int key)
     }
     if (overlay_active)
     {
-        switch (key)
-        {
-            case MODULE_KEY_WHEEL_UP: case MODULE_KEY_WHEEL_LEFT: case MODULE_KEY_PRESS_UP:
-                push_key(PK_UP); return 0;
-            case MODULE_KEY_WHEEL_DOWN: case MODULE_KEY_WHEEL_RIGHT: case MODULE_KEY_PRESS_DOWN:
-                push_key(PK_DOWN); return 0;
-            case MODULE_KEY_PRESS_LEFT:  push_key(PK_LEFT);  return 0;
-            case MODULE_KEY_PRESS_RIGHT: push_key(PK_RIGHT); return 0;
-            case MODULE_KEY_PRESS_SET:   push_key(PK_SET);       return 0;
-            case MODULE_KEY_PRESS_HALFSHUTTER:
-                push_key(PK_CLOSE); return 1;               /* close, and still focus */
-            case MODULE_KEY_UNPRESS_HALFSHUTTER: case MODULE_KEY_UNPRESS_SET:
-            case MODULE_KEY_UNPRESS_UDLR:
-                return 1;
-            default:
-                push_key(PK_CLOSE); return 0;               /* MENU, INFO, PLAY, REC ... */
-        }
+        struct key_route r = moth_route_key(key);
+        if (r.panel_key != PK_NONE) push_key(r.panel_key);
+        return r.pass_to_canon;
     }
 
     int trigger = cfg_key == 1 && key == MODULE_KEY_INFO;
