@@ -35,6 +35,11 @@
 struct cam_state cam;
 int gui_state;
 static int raw_recordings, h264_recordings;
+static const int shutters[] = { 33, 40, 50, 60, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000 };
+static const int fstops10[] = { 14, 16, 18, 20, 22, 25, 28, 32, 35, 40, 45, 50, 56, 63, 71, 80, 90, 100, 110, 130, 140, 160, 180, 200, 220 };
+static const int isos[] = { 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400 };
+static int sh_i = 2, ap_i = 6, iso_i = 9, auto_expo, lens_min_i = 0, lens_max_i = 21;
+static int lens_changes;
 static uint32_t now_ms;
 static uint8_t * bmp;                       /* 960 x 480, like the EOS M's BMP VRAM */
 struct font font_dynamic[UF_COUNT];
@@ -377,6 +382,8 @@ static void press_down_eosm(int hold_ms)
      - DOWN and SET go through ML's long-press check (redraw, then a fake press + release)
      - RIGHT never reaches ML in LiveView: Canon acts on it and only "info changed" (0x69)
        and the release (0x27) arrive */
+static int step(int * i, int n, int sign, int lo, int hi);
+static void lens_sync(void);
 static void press_set_eosm(int hold_ms)
 {
     if (gui_state != 0)
@@ -395,6 +402,14 @@ static void press_set_eosm(int hold_ms)
 
 static void tap(int canon, int hold_ms)
 {
+    if ((canon == K_WR || canon == K_WL) && cam.lv_on && !cam.menu_shown)
+    {
+        /* Canon keeps the rear dial in LiveView: manual movie exposure -> shutter */
+        if (cam.lens.raw_shutter) { step(&sh_i, COUNT(shutters), canon == K_WR ? 1 : -1, 0, COUNT(shutters) - 1); lens_sync(); }
+        gui_event(K_UNHANDLED); gui_event(K_OLC);
+        run_for(hold_ms);
+        return;
+    }
     if (canon == K_DOWN) { press_down_eosm(hold_ms); gui_event(K_UNHANDLED); return; }
     if (canon == K_SET && cam.lv_on && !cam.menu_shown) { press_set_eosm(hold_ms); return; }
     if (canon == K_RIGHT && cam.lv_on && !cam.menu_shown)
@@ -416,6 +431,15 @@ static void tap(int canon, int hold_ms)
 }
 
 /* ---------------------------------------------------------------- world ticking */
+
+static uint32_t touch_raw = 0xffffffff;     /* what Canon keeps at 0x4D868 */
+static int peeks_bad_addr;
+uint32_t camsim_peek32(uint32_t addr) { if (addr != 0x4D868) peeks_bad_addr++; return touch_raw; }
+static void touch_at(int x, int y)
+{
+    touch_raw = ((uint32_t)y << 16) | (uint32_t)x;
+    gui_event(K_TOUCH); run_for(60); gui_event(K_UNTOUCH); run_for(60);
+}
 
 static int sent_q[16], sent_n;
 int module_send_keypress(int module_key)
@@ -513,11 +537,7 @@ void bmp_fill(uint8_t col, int x, int y, int w, int h)
 
 /* the lens and exposure, Canon-like: third stops, limits, auto exposure, manual lenses.
    Like ML's steppers, each change waits for Canon to confirm (~40 ms). */
-static const int shutters[] = { 33, 40, 50, 60, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000 };
-static const int fstops10[] = { 14, 16, 18, 20, 22, 25, 28, 32, 35, 40, 45, 50, 56, 63, 71, 80, 90, 100, 110, 130, 140, 160, 180, 200, 220 };
-static const int isos[] = { 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400 };
-static int sh_i = 2, ap_i = 6, iso_i = 9, auto_expo, lens_min_i = 0, lens_max_i = 21;
-static int lens_changes;
+
 static void lens_sync(void)
 {
     cam.lens.raw_shutter = auto_expo ? 0 : 56 + sh_i * 3;
@@ -664,7 +684,7 @@ static void post_frame_checks(void)
                 break;
             }
     }
-    if (getenv("TRACE2") && now_ms > (uint32_t)atoi(getenv("TRACE2"))) fprintf(stderr, "    f @%u ov %d st %d half %d lv %d movie %d menu %d disp %d apply %d ring %d/%d bp %d\n", now_ms, overlay_active, panel.state, tween_value(&panel.reveal, now_ms), cam.lv_on, cam.movie, cam.menu_shown, cam.display_on, apply_phase, key_head, key_tail, begin_pending);
+    if (getenv("TRACE2") && now_ms > (uint32_t)atoi(getenv("TRACE2"))) fprintf(stderr, "    f @%u ov %d mode %d qb %d pfb %d st %d half %d lv %d movie %d menu %d disp %d apply %d hb %d kr %d ring %d/%d bp %d\n", now_ms, overlay_active, ov_mode, qbar.state, panel_from_bar, panel.state, tween_value(&panel.reveal, now_ms), cam.lv_on, cam.movie, cam.menu_shown, cam.display_on, apply_phase, handing_back, keys_released, key_head, key_tail, begin_pending);
     if (overlay_active) begin_pending = 0;
     if (!overlay_active && !begin_pending && gui_state == MOTH_GUI_STATE)
         FAIL("ML's gui_state left at Mothlight's value with the panel closed");
@@ -711,8 +731,8 @@ static void open_panel(void)
 
 static void close_panel(void)
 {
-    tap(K_INFO, 0);
-    run_for(800);
+    /* INFO on a list opened from the quick bar goes back to the bar; INFO again closes */
+    for (int i = 0; i < 3 && overlay_active; i++) { tap(K_INFO, 0); run_for(800); }
     EXPECT(!overlay_active, "panel did not close");
 }
 
@@ -735,7 +755,7 @@ static void s_basic_navigation(void)
     tap(K_UP, 80); run_for(200);
     EXPECT(panel.sel == sel0 + 2, "UP did not move selection back");
     tap(K_WR, 0); tap(K_WR, 0); run_for(200);
-    EXPECT(panel.sel == sel0 + 4, "rear dial did not scroll");
+    EXPECT(panel.sel == sel0 + 2 && panel_open_now(), "Canon's dial (shutter) moved the list or closed the panel");
     EXPECT(canon_key_redraws_open == r0, "%d navigation keys leaked to Canon, which redraws on them (the black flash)",
            canon_key_redraws_open - r0);
     EXPECT(!canon_got[K_DOWN] && !canon_got[K_DOWN_UP] && !canon_got[K_UP_UP], "navigation keys leaked to Canon");
@@ -923,8 +943,8 @@ static void open_bar(void)
 
 static void bar_select(int item)
 {
-    for (int i = 0; i < QB_COUNT && qbar.sel != item; i++) { tap(K_DOWN, 30); run_for(60); }
-    EXPECT(qbar.sel == item, "could not select bar item %d (sel %d)", item, qbar.sel);
+    for (int i = 0; i < QB_COUNT && qbar.sel != item; i++) { tap(K_SET, 30); run_for(60); }
+    EXPECT(qbar.sel == item, "SET did not get to bar item %d (sel %d)", item, qbar.sel);
 }
 
 static void s_qbar_basic(void)
@@ -932,7 +952,7 @@ static void s_qbar_basic(void)
     boot(); open_bar();
     EXPECT(screen_says("SHUTTER") && screen_says("1/50") && screen_says("f/2.8") && screen_says("800") && screen_says("5600K"),
            "bar does not show the camera's values:\n%s", ui_text_drawn);
-    EXPECT(screen_says("UP / DOWN choose"), "no hint after opening");
+    EXPECT(screen_says("SET next"), "no hint after opening");
     /* LiveView above the bar stays untouched (transparent) */
     int dirty_above = 0;
     for (int y = 0; y < QB_STRIP_Y && !dirty_above; y += 3)
@@ -940,21 +960,35 @@ static void s_qbar_basic(void)
     EXPECT(!dirty_above, "the bar drew above its area (LiveView should show there)");
 
     bar_select(QB_SHUTTER);
-    tap(K_WR, 0); run_for(200);
-    EXPECT(sh_i == 3 && screen_says("1/60"), "dial on SHUTTER: index %d\n%s", sh_i, ui_text_drawn);
+    tap(K_UP, 30); run_for(200);
+    EXPECT(sh_i == 3 && screen_says("1/60"), "UP on SHUTTER: index %d\n%s", sh_i, ui_text_drawn);
     bar_select(QB_APERTURE);
-    tap(K_WL, 0); tap(K_WL, 0); run_for(300);
-    EXPECT(ap_i == 4 && screen_says("f/2.2"), "dial on APERTURE: index %d", ap_i);
+    tap(K_DOWN, 30); tap(K_DOWN, 30); run_for(300);
+    EXPECT(ap_i == 4 && screen_says("f/2.2"), "DOWN x2 on APERTURE: index %d", ap_i);
     bar_select(QB_ISO);
-    tap(K_WR, 0); run_for(200);
-    EXPECT(iso_i == 10 && screen_says("1000"), "dial on ISO: index %d", iso_i);
+    tap(K_UP, 30); run_for(200);
+    EXPECT(iso_i == 10 && screen_says("1000"), "UP on ISO: index %d", iso_i);
     bar_select(QB_WB);
-    tap(K_WL, 0); run_for(200);
-    EXPECT(cam.lens.kelvin == 5500 && screen_says("5500K"), "dial on WB: %uK", cam.lens.kelvin);
-    EXPECT(!canon_got[K_WR] && !canon_got[K_WL] && !canon_got[K_DOWN], "bar keys leaked to Canon");
+    tap(K_DOWN, 30); run_for(200);
+    EXPECT(cam.lens.kelvin == 5500 && screen_says("5500K"), "DOWN on WB: %uK", cam.lens.kelvin);
+    tap(K_SET, 30); tap(K_SET, 30); run_for(200);
+    EXPECT(qbar.sel == QB_SHUTTER, "SET does not wrap around (sel %d)", qbar.sel);
+    EXPECT(!canon_got[K_DOWN] && !canon_got[K_UP] && !canon_got[K_QSET], "bar keys leaked to Canon");
     printf("    worst overdraw with the bar: %d ms\n", worst_overdraw);
     tap(K_INFO, 0); run_for(400);
     EXPECT(!overlay_active && gui_state == 0, "INFO did not close the bar cleanly");
+    finish();
+}
+
+static void s_qbar_dial(void)
+{
+    boot(); open_bar();
+    bar_select(QB_ISO);                     /* whatever is selected, the dial is Canon's shutter */
+    tap(K_WR, 0); run_for(150);
+    EXPECT(sh_i == 3 && iso_i == 9, "dial: shutter index %d, iso index %d", sh_i, iso_i);
+    EXPECT(screen_says("1/60"), "bar did not follow Canon's shutter within 150 ms\n%s", ui_text_drawn);
+    tap(K_WL, 0); tap(K_WL, 0); run_for(150);
+    EXPECT(screen_says("1/40"), "bar did not follow the dial back\n%s", ui_text_drawn);
     finish();
 }
 
@@ -964,18 +998,18 @@ static void s_qbar_locked(void)
     boot(); open_bar();
     EXPECT(screen_says("Auto") && screen_says("auto (Canon)"), "auto exposure not shown:\n%s", ui_text_drawn);
     bar_select(QB_SHUTTER);
-    tap(K_WR, 0); run_for(200);
-    EXPECT(lens_changes == 0 && screen_says("Movie exposure to Manual"), "dial on automatic shutter: no explanation\n%s", ui_text_drawn);
+    tap(K_UP, 30); run_for(200);
+    EXPECT(lens_changes == 0 && screen_says("Movie exposure to Manual"), "UP on automatic shutter: no explanation\n%s", ui_text_drawn);
     bar_select(QB_ISO);
-    tap(K_WR, 0); run_for(200);
-    EXPECT(screen_says("ISO is automatic"), "dial on automatic ISO: no explanation\n%s", ui_text_drawn);
+    tap(K_UP, 30); run_for(200);
+    EXPECT(screen_says("ISO is automatic"), "UP on automatic ISO: no explanation\n%s", ui_text_drawn);
     tap(K_INFO, 0); run_for(400);
     auto_expo = 0; lens_sync();
     cam.lens.lens_exists = 0; lens_sync();  /* a manual (adapted) lens */
     open_bar();
     bar_select(QB_APERTURE);
-    tap(K_WR, 0); run_for(200);
-    EXPECT(screen_says("Manual lens"), "dial on a manual lens: no explanation\n%s", ui_text_drawn);
+    tap(K_UP, 30); run_for(200);
+    EXPECT(screen_says("Manual lens"), "UP on a manual lens: no explanation\n%s", ui_text_drawn);
     finish();
 }
 
@@ -983,7 +1017,7 @@ static void s_qbar_limits(void)
 {
     boot(); open_bar();
     bar_select(QB_APERTURE);
-    for (int i = 0; i < 12; i++) { tap(K_WL, 0); run_for(60); }
+    for (int i = 0; i < 12; i++) { tap(K_DOWN, 20); run_for(60); }
     EXPECT(ap_i == lens_min_i, "aperture went past the lens (index %d)", ap_i);
     EXPECT(screen_says("That is the limit"), "no message at the lens limit\n%s", ui_text_drawn);
     finish();
@@ -993,15 +1027,42 @@ static void s_qbar_to_panel(void)
 {
     boot(); open_bar();
     bar_select(QB_PROFILE);
-    tap(K_SET, 40); run_for(800);
-    EXPECT(overlay_active && ov_mode == OV_PANEL && panel.state == PS_OPEN, "SET on PROFILE did not open the profiles (mode %d)", ov_mode);
+    tap(K_DOWN, 40); run_for(800);
+    EXPECT(overlay_active && ov_mode == OV_PANEL && panel.state == PS_OPEN, "DOWN on PROFILE did not open the list (mode %d)", ov_mode);
+    tap(K_INFO, 0); run_for(800);
+    EXPECT(overlay_active && ov_mode == OV_BAR && qbar.state == QB_OPEN, "closing the list did not go back to the bar (mode %d)", ov_mode);
+    tap(K_UP, 40); run_for(800);
+    EXPECT(ov_mode == OV_PANEL, "UP on PROFILE did not open the list");
     int idx = find_profile(MOOD_1X1);
     select_profile(idx);
-    tap(K_SET, 40); run_for(2500);
-    EXPECT(cfg_active == idx, "apply from the bar's panel failed (active %d)", cfg_active);
-    run_for(2500);
-    open_bar();
-    EXPECT(screen_says(profiles[idx].name), "bar does not show the profile in use\n%s", ui_text_drawn);
+    tap(K_SET, 40); run_for(5000);         /* apply, "Ready", the list closes itself ... */
+    EXPECT(cfg_active == idx, "apply from the list failed (active %d)", cfg_active);
+    EXPECT(overlay_active && ov_mode == OV_BAR, "after applying, not back on the bar (overlay %d mode %d)", overlay_active, ov_mode);
+    EXPECT(screen_says(profiles[idx].name), "bar does not show the new profile\n%s", ui_text_drawn);
+    tap(K_INFO, 0); run_for(500);
+    EXPECT(!overlay_active, "INFO on the bar after the list did not close");
+    finish();
+}
+
+static void s_qbar_touch(void)
+{
+    boot(); open_bar();
+    touch_at(3 * 144 + 60, 450);            /* WB tile */
+    EXPECT(qbar.sel == QB_WB, "tap on WB did not select it (sel %d)", qbar.sel);
+    touch_at(4 * 144 + 60, 440);            /* PROFILE: select ... */
+    EXPECT(qbar.sel == QB_PROFILE && ov_mode == OV_BAR, "tap on PROFILE: sel %d mode %d", qbar.sel, ov_mode);
+    touch_at(4 * 144 + 60, 440);            /* ... and a second tap opens the list */
+    run_for(600);
+    EXPECT(ov_mode == OV_PANEL, "second tap on PROFILE did not open the list");
+    tap(K_INFO, 0); run_for(800);
+    /* a position that cannot be right, or a tap above the bar: nothing happens */
+    int s0 = qbar.sel;
+    touch_raw = 0xdeadbeef; gui_event(K_TOUCH); run_for(40); gui_event(K_UNTOUCH); run_for(100);
+    touch_at(300, 100);
+    EXPECT(qbar.sel == s0 && ov_mode == OV_BAR && overlay_active, "implausible / off-bar tap changed something");
+    EXPECT(peeks_bad_addr == 0, "read RAM somewhere other than Canon's touch position");
+    run_for(300); tap(K_INFO, 0); run_for(3500);
+    EXPECT(strstr(logfile, "touch 0x70") && strstr(logfile, "(used)"), "touch reads not in the log:\n%s", logfile);
     finish();
 }
 
@@ -1479,6 +1540,8 @@ static void s_soak(void)
         else if (r < 90) { ui_stall_once = 1000 + rand() % 2500; }
         else if (r < 91) { canon_periodic_ms = canon_periodic_ms ? 0 : 900; }
         else if (r < 93) { cfg_key = 1 + rand() % 2; }   /* INFO opens the bar or the profiles */
+        else if (r < 95) { touch_raw = rand() % 3 ? (uint32_t)((rand() % 480) << 16 | (rand() % 720)) : (uint32_t)rand();
+                           gui_event(K_TOUCH); run_for(rand() % 80); gui_event(K_UNTOUCH); }
         run_for(rand() % 150);
         if (overlay_active) opens++;
         /* keep the world able to show the panel most of the time */
@@ -1564,10 +1627,12 @@ static const struct sc all[] = {
     { "ML's gui_state held while open: no long-press flash on DOWN/SET", s_gui_state },
     { "REC with the panel open starts RAW (MLV Lite), not H.264", s_rec_raw_while_open },
     { "two-finger tap with the panel open: close and open ML's menu", s_two_finger_while_open },
-    { "quick bar: values, dial changes each setting, LiveView left alone", s_qbar_basic },
+    { "quick bar: values, SET next, UP/DOWN change, LiveView left alone", s_qbar_basic },
+    { "quick bar: the dial is Canon's shutter; the bar follows it", s_qbar_dial },
+    { "quick bar: tap selects a tile, tap PROFILE twice opens the list", s_qbar_touch },
     { "quick bar: auto exposure, auto ISO, manual lens explained", s_qbar_locked },
     { "quick bar: lens limits", s_qbar_limits },
-    { "quick bar: SET on PROFILE opens the profiles, then back", s_qbar_to_panel },
+    { "quick bar: UP/DOWN on PROFILE opens the list; closing / applying returns to the bar", s_qbar_to_panel },
     { "quick bar: REC starts RAW", s_qbar_rec },
     { "quick bar: follows values Canon changes", s_qbar_external },
     { "quick bar: every theme, text fits", s_qbar_themes },

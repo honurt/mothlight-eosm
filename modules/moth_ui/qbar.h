@@ -7,8 +7,10 @@
  *   1/50        f/2.8       800        5600K      2.5K Cinema
  *   180°        f/1.4-16    native     Kelvin     OK  ~20 min
  *
- * UP / DOWN choose the setting, the rear dial changes it, SET on PROFILE opens the profile
- * panel, INFO closes. Like panel.c this is pure drawing and state: the camera side
+ * On the EOS M in LiveView Canon keeps the rear dial (shutter) and LEFT / RIGHT for itself,
+ * so: SET moves to the next setting, UP / DOWN change it, the dial is Canon's shutter (the bar
+ * follows it), UP / DOWN on PROFILE open the profile list, INFO closes. A tap on a tile
+ * selects it (and on PROFILE opens the list) when the touch position can be read. Like panel.c this is pure drawing and state: the camera side
  * (moth_ui.c) reads and sets the values; the PC simulators run the same code.
  */
 #ifndef MOTH_QBAR_H
@@ -61,6 +63,8 @@ struct qbar
 void qbar_open(struct qbar * q, const struct qbar_view * v, uint32_t now);
 void qbar_close(struct qbar * q, const struct qbar_view * v, uint32_t now);
 int  qbar_key(struct qbar * q, const struct qbar_view * v, int key, uint32_t now);
+/* a tap at screen (x, y): selects the tile under it; a tap on the selected tile activates it */
+int  qbar_tap(struct qbar * q, const struct qbar_view * v, int x, int y, uint32_t now);
 void qbar_toast(struct qbar * q, const char * msg, int bad, uint32_t now);
 void qbar_changed(struct qbar * q);         /* values changed: redraw the tiles */
 int  qbar_frame(struct qbar * q, const struct qbar_view * v, struct canvas * back,

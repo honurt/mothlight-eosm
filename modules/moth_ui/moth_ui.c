@@ -80,6 +80,8 @@ static int ov_mode;
 static struct qbar qbar;
 static struct qbar_view qview;
 static uint32_t qview_read_at;
+static int panel_from_bar;                  /* the profile list was opened from the quick bar: go back to it */
+static volatile int tap_pending, tap_x, tap_y;   /* a tap on the quick bar (touch position read from RAM) */
 
 static uint8_t * back_buf;                  /* the panel's own drawing buffer, only while open */
 static struct canvas back;
@@ -144,7 +146,7 @@ static const char * close_why[] = { "", "closed by a key", "closed by REC/PLAY/s
                                     "recording started", "photo mode", "display off", "LiveView gone",
                                     "watchdog (task stalled)", "auto-close after apply" };
 
-struct log_ev { uint32_t t; short code; char kind; signed char a, b; };
+struct log_ev { uint32_t t; short code; char kind; signed char a, b; uint32_t v; };
 #define LOG_N 192
 static struct log_ev log_ring[LOG_N];
 static volatile unsigned log_n;
@@ -153,9 +155,12 @@ static volatile uint32_t closed_at;          /* keep logging buttons for 3 s aft
 #define LOG_AFTER_CLOSE_MS 3000
 static int logging(void) { return overlay_active || get_ms_clock() - closed_at < LOG_AFTER_CLOSE_MS; }
 
-static void mlog(char kind, int code, int a, int b)
+static void mlog_v(char kind, int code, int a, int b, uint32_t v);
+static void mlog(char kind, int code, int a, int b) { mlog_v(kind, code, a, b, 0); }
+static void mlog_v(char kind, int code, int a, int b, uint32_t v)
 {
     unsigned i = log_n++ % LOG_N;
+    log_ring[i].v = v;
     log_ring[i].t = get_ms_clock();
     log_ring[i].code = (short)code;
     log_ring[i].kind = kind;
@@ -181,6 +186,10 @@ static int log_line(char * out, int len, const struct log_ev * e)
         case 'T': return snprintf(out, len, "%7d  theme -> %d\n", (int)e->t, e->code);
         case 'A': return snprintf(out, len, "%7d  apply step %d (%d)\n", (int)e->t, e->code, e->a);
         case 'L': return snprintf(out, len, "%7d  LiveView %s\n", (int)e->t, e->code ? "back" : "gone");
+        case 'X': return snprintf(out, len, "%7d  touch 0x%02x  pos 0x%08x  -> x %d y %d%s\n", (int)e->t, e->code & 0xffff,
+                                  (int)e->v, (int)(e->v & 0xffff), (int)(e->v >> 16), e->a ? "  (used)" : "");
+        case 'Y': return snprintf(out, len, "%7d  touch 0x%02x  obj 0x%08x arg 0x%x\n", (int)e->t, e->code & 0xffff,
+                                  (int)e->v, e->a);
         case 'E': return snprintf(out, len, "%7d  quick bar: setting %d %s, %s\n", (int)e->t, e->code,
                                   e->a > 0 ? "up" : "down", e->b ? "changed" : "unchanged");
     }
@@ -548,7 +557,7 @@ static void qb_fill(struct qbar_view * q)
     else
     {
         copy_str(it->value, sizeof(it->value), "Choose");
-        copy_str(it->sub, sizeof(it->sub), "SET: profiles");
+        copy_str(it->sub, sizeof(it->sub), "UP/DOWN: list");
         it->sub_tone = QT_ACCENT;
     }
 }
@@ -672,6 +681,8 @@ static void overlay_end(int why)
     release_gui_state();
     overlay_active = 0;
     ov_mode = 0;
+    panel_from_bar = 0;
+    tap_pending = 0;
     panel.state = PS_CLOSED;
     qbar.state = QB_CLOSED;
     apply_phase = 0;                        /* an apply cut short is not resumed on the next open */
@@ -843,11 +854,15 @@ static void moth_task(void)
         if (overlay_active && ov_mode == OV_BAR)
         {
             int k, closed = 0, to_panel = 0;
-            while ((k = pop_key()) != PK_NONE)
+            int pending_tap = tap_pending;
+            tap_pending = 0;
+            while ((k = pop_key()) != PK_NONE || pending_tap)
             {
                 repaint_until = now + 300;
                 if (k == PK_CLOSE_NOW) { overlay_end(CLOSE_KEY_PASS); closed = 1; break; }
-                int act = qbar_key(&qbar, &qview, k, now);
+                int act;
+                if (k == PK_NONE) { act = qbar_tap(&qbar, &qview, tap_x, tap_y, now); pending_tap = 0; }
+                else act = qbar_key(&qbar, &qview, k, now);
                 if (act == QA_ADJUST)
                 {
                     qb_adjust(qbar.adj_item, qbar.adj_sign, now);
@@ -868,14 +883,16 @@ static void moth_task(void)
                 present_rows(QB_TOP, UI_H);
                 qbar.state = QB_CLOSED;
                 ov_mode = OV_PANEL;
+                panel_from_bar = 1;
                 fill_view();
                 panel_open(&panel, &view, now);
                 mlog('O', cfg_theme, profile_count, OV_PANEL);
                 continue;
             }
 
-            /* Canon can change values itself (auto ISO, a lens swap): look 4 times a second */
-            if (now - qview_read_at > 250)
+            /* Canon changes values itself: the dial is its shutter, auto ISO, a lens swap.
+               Look 10 times a second (a few property reads). */
+            if (now - qview_read_at > 100)
             {
                 static struct qbar_view fresh;
                 qb_fill(&fresh);
@@ -957,6 +974,20 @@ static void moth_task(void)
                 if ((int32_t)(repaint_until - now) > 0) present_full();
                 else if (screen_was_disturbed()) { present_full(); mlog('R', 0, 0, 0); }
             }
+            if ((fl & PF_CLOSED) && panel_from_bar)
+            {
+                /* back to the quick bar, which now shows the profile in use */
+                panel_from_bar = 0;
+                memset(back_buf, 0, UI_W * UI_H);
+                present_rows(0, UI_H);
+                ov_mode = OV_BAR;
+                qb_fill(&qview);
+                qbar_open(&qbar, &qview, get_ms_clock());
+                qview_read_at = get_ms_clock();
+                mlog('O', cfg_theme, profile_count, OV_BAR);
+                msleep(20);
+                continue;
+            }
             if (fl & PF_CLOSED) overlay_end(was_done ? CLOSE_DONE : CLOSE_KEY);
             msleep(20);                     /* 50 Hz: a foreign redraw is gone within one frame */
             continue;
@@ -1031,6 +1062,27 @@ static unsigned int moth_keypress_cbr(unsigned int key)
     return 1;
 }
 
+/* Touch position, experimental. ML gives modules only "touched" / "released" events, but its
+   EOS M notes (platform/EOSM.202/consts.h) document where Canon keeps the position:
+   TOUCH_XY_RAW1 = 0x4D868, found with memspy, Y in the upper half-word and X in the lower
+   (0..719, 0..479). Reading RAM is harmless; a position is used only when it is plausible,
+   and every read is logged so it can be checked against the camera. */
+#define EOSM_TOUCH_XY_ADDR 0x4D868
+#ifndef moth_peek32
+#define moth_peek32(addr) (*(volatile uint32_t *)(addr))
+#endif
+#define EOSM_TOUCH_1     0x6f
+#define EOSM_UNTOUCH_1   0x70
+
+static int touch_pos(int * x, int * y, uint32_t * raw)
+{
+    uint32_t v = moth_peek32(EOSM_TOUCH_XY_ADDR);
+    *raw = v;
+    *x = (int)(v & 0xffff);
+    *y = (int)(v >> 16);
+    return *x < 720 && *y < 480 && v != 0xffffffff;
+}
+
 /* EOS M D-pad release codes (platform/EOSM.202/gui.h). ML has no portable name for them,
    so the portable handler above only sees key 0. Passed on, they make Canon redraw its
    LiveView screen over the panel (a black flash, and wiped bars). Swallow them while open. */
@@ -1045,6 +1097,17 @@ static unsigned int moth_keypress_raw_cbr(unsigned int raw)
     const struct event * e = (const struct event *) raw;
     if (e && e->type == 0 && e->param >= 0 && logging()) mlog('K', e->param, overlay_active, IS_FAKE(e) ? 1 : 0);
     if (!overlay_active || keys_released || handing_back) return 1;
+    if (e && e->type == 0 && (e->param == EOSM_TOUCH_1 || e->param == EOSM_UNTOUCH_1 || e->param == 0x0f || e->param == 0x11))
+    {
+        int x, y; uint32_t v;
+        int ok = touch_pos(&x, &y, &v);
+        mlog_v('Y', e->param, e->arg, 0, (uint32_t)(uintptr_t)e->obj);
+        if (e->param == EOSM_UNTOUCH_1 && ok && ov_mode == OV_BAR)
+        {
+            tap_x = x; tap_y = y; tap_pending = 1;
+        }
+        mlog_v('X', e->param, e->param == EOSM_UNTOUCH_1 && ok && ov_mode == OV_BAR, 0, v);
+    }
     if (e && e->type == 0)
         switch (e->param)
         {

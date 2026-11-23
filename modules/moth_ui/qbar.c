@@ -90,32 +90,47 @@ void qbar_toast(struct qbar * q, const char * msg, int bad, uint32_t now)
 
 void qbar_changed(struct qbar * q) { q->dirty = 1; }
 
+static void select_tile(struct qbar * q, const struct qbar_view * v, int sel, uint32_t now)
+{
+    sel = (sel % QB_COUNT + QB_COUNT) % QB_COUNT;
+    tween_retarget(&q->hl, tween_value(&q->hl, now), sel * TILE_W, now, dur(v, T_HL));
+    q->sel = sel;
+    q->dirty = 1;
+}
+
+static int adjust(struct qbar * q, const struct qbar_view * v, int sign)
+{
+    q->adj_item = q->sel;
+    q->adj_sign = sign;
+    if (q->sel == QB_PROFILE) return QA_OPEN_PANEL;     /* "changing" the profile: the list */
+    return v->item[q->sel].locked ? QA_LOCKED : QA_ADJUST;
+}
+
 int qbar_key(struct qbar * q, const struct qbar_view * v, int key, uint32_t now)
 {
     if (q->state != QB_OPEN && q->state != QB_OPENING) return QA_NONE;
     switch (key)
     {
-        case PK_UP: case PK_DOWN:
-        {
-            int sel = (q->sel + (key == PK_UP ? QB_COUNT - 1 : 1)) % QB_COUNT;
-            tween_retarget(&q->hl, tween_value(&q->hl, now), sel * TILE_W, now, dur(v, T_HL));
-            q->sel = sel;
-            q->dirty = 1;
-            return QA_NONE;
-        }
-        case PK_WHEEL_PREV: case PK_WHEEL_NEXT:
-            q->adj_item = q->sel;
-            q->adj_sign = key == PK_WHEEL_NEXT ? 1 : -1;
-            if (q->sel == QB_PROFILE) return QA_OPEN_PANEL;     /* the dial on PROFILE opens the list too */
-            return v->item[q->sel].locked ? QA_LOCKED : QA_ADJUST;
-        case PK_SET:
-            if (q->sel == QB_PROFILE) return QA_OPEN_PANEL;
-            q->adj_item = q->sel;
-            return v->item[q->sel].locked ? QA_LOCKED : QA_NONE;
+        case PK_SET:        select_tile(q, v, q->sel + 1, now); return QA_NONE;
+        case PK_UP:         return adjust(q, v, +1);
+        case PK_DOWN:       return adjust(q, v, -1);
+        case PK_WHEEL_NEXT: return adjust(q, v, +1);   /* if the dial ever reaches us */
+        case PK_WHEEL_PREV: return adjust(q, v, -1);
         case PK_CLOSE:
             qbar_close(q, v, now);
             return QA_CLOSE;
     }
+    return QA_NONE;
+}
+
+int qbar_tap(struct qbar * q, const struct qbar_view * v, int x, int y, uint32_t now)
+{
+    if (q->state != QB_OPEN) return QA_NONE;
+    if (y < QB_Y || y >= SH || x < 0 || x >= SW) return QA_NONE;
+    int tile = x / TILE_W;
+    if (tile >= QB_COUNT) tile = QB_COUNT - 1;
+    if (tile != q->sel) { select_tile(q, v, tile, now); return QA_NONE; }
+    if (tile == QB_PROFILE) return QA_OPEN_PANEL;
     return QA_NONE;
 }
 
@@ -153,7 +168,7 @@ static const char * strip_text(const struct qbar * q, uint32_t now, int * bad)
 {
     *bad = 0;
     if (q->toast[0] && (int32_t)(q->toast_until - now) > 0) { *bad = q->toast_bad; return q->toast; }
-    if ((int32_t)(q->hint_until - now) > 0) return "UP / DOWN choose     DIAL change     INFO close";
+    if ((int32_t)(q->hint_until - now) > 0) return "SET next    UP / DOWN change    DIAL shutter    INFO close";
     return 0;
 }
 

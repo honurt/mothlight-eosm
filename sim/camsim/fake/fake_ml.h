@@ -109,6 +109,8 @@ const char * lens_format_iso(int raw);
 int get_current_shutter_reciprocal_x1000(void);
 
 struct event { int type; int param; void * obj; int arg; };
+uint32_t camsim_peek32(uint32_t addr);
+#define moth_peek32(addr) camsim_peek32(addr)
 #define FAKE_BTN 0x7E57
 #define IS_FAKE(event) ((event)->arg == FAKE_BTN)
 

@@ -49,11 +49,13 @@ in the release notes.
 ### Quick bar (INFO, default)
 
 - [ ] INFO in movie mode opens the bar at the bottom; LiveView stays visible above it
-- [ ] UP / DOWN move between SHUTTER, APERTURE, ISO, WB, PROFILE; the rear dial changes the value
+- [ ] SET moves between SHUTTER, APERTURE, ISO, WB, PROFILE; UP / DOWN change the value
+- [ ] The rear dial changes the shutter (Canon) and the bar follows at once
+- [ ] Tapping a tile selects it; tapping PROFILE again opens the list (check MOTHLOG.TXT "touch" lines)
 - [ ] Shutter shows its angle (green near 180); aperture shows the lens range
 - [ ] With Canon's Movie exposure on Auto, SHUTTER / APERTURE say "auto (Canon)" and the dial explains why
 - [ ] A manual (adapted) lens: APERTURE says so
-- [ ] SET (or the dial) on PROFILE opens the profile list; INFO closes; REC starts RAW
+- [ ] UP / DOWN on PROFILE open the profile list; INFO there goes back to the bar; REC starts RAW
 - [ ] No black flash on DOWN or SET
 
 ### Applying

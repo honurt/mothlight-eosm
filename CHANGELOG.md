@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 (24 Nov 2026, from the camera's log)
+
+- The rear dial never reaches ML in LiveView: in manual movie exposure Canon uses it for the
+  shutter (the log shows only 0x54 + 0x69 per click; Bilal says the same for Crop Mood). The
+  quick bar now works with the keys the EOS M gives: SET moves to the next setting, UP / DOWN
+  change it, the dial stays Canon's shutter and the bar follows it at 10 Hz.
+- UP / DOWN on PROFILE open the profile list; closing it, or applying, goes back to the bar.
+- Tap a tile to select it, tap PROFILE again for the list -- experimental: the touch position
+  is read from Canon's RAM (0x4D868, from ML's EOS M notes), used only when plausible, logged.
+
 ## 0.2.0 (24 Nov 2026)
 
 - **Quick bar**: INFO now opens a Canon-style strip over LiveView with shutter (and its angle),
