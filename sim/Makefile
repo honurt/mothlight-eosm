@@ -5,7 +5,7 @@
 CC      ?= cc
 CFLAGS  ?= -DMOTH_SIM -O2 -std=gnu99 -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -g
 UI      = ../modules/moth_ui
-SRC     = $(UI)/themes.c $(UI)/panel.c $(UI)/ui_gfx.c $(UI)/ui_text.c $(UI)/budget.c $(UI)/profiles.c
+SRC     = $(UI)/themes.c $(UI)/panel.c $(UI)/qbar.c $(UI)/ui_gfx.c $(UI)/ui_text.c $(UI)/budget.c $(UI)/profiles.c
 FONTS  ?= $(firstword $(wildcard ../work/cropmood/data/fonts ../work/upstream/data/fonts))
 OUT    ?= ../out/preview
 

@@ -572,6 +572,8 @@ void panel_theme_changed(struct panel * p)
 
 int panel_key(struct panel * p, const struct panel_view * v, int key, uint32_t now)
 {
+    if (key == PK_WHEEL_PREV) key = PK_UP;
+    if (key == PK_WHEEL_NEXT) key = PK_DOWN;
     if (p->state == PS_DONE && key != PK_NONE)
     {
         /* a result is showing: INFO / MENU close, anything else dismisses it and goes on

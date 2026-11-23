@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0 (24 Nov 2026)
+
+- **Quick bar**: INFO now opens a Canon-style strip over LiveView with shutter (and its angle),
+  aperture, ISO, white balance and the profile. UP / DOWN choose, the rear dial changes the value
+  using ML's own steppers (Canon's steps, the lens range), SET on PROFILE opens the profile list.
+  Explains auto exposure and manual lenses instead of silently doing nothing. Crop Mood hides
+  Canon's own controls in x5 zoom; this puts them back. Movie > Mothlight > "INFO opens" picks the
+  bar, the profiles or nothing.
+- No black flash on DOWN / SET: while the panel or bar is up, ML's gui_state holds a non-idle
+  value so its EOS M long-press redraw does not run; REC / PLAY / two-finger tap hand it back.
+
 ## 0.1.2 (second camera test, 24 Nov 2026)
 
 From the camera's own event log (ML/LOGS/MOTHLOG.TXT):

@@ -37,6 +37,7 @@
 
 #include "version.h"
 #include "panel.h"
+#include "qbar.h"
 #include "keymap.h"
 #include "repair.h"
 #include "ui_text.h"
@@ -50,7 +51,7 @@ extern int fps_get_current_x1000();
 /* ---------------------------------------------------------------- settings */
 
 static CONFIG_INT("moth.theme",   cfg_theme,   THEME_MOTHLIGHT);
-static CONFIG_INT("moth.key",     cfg_key,     1);    /* 0 off, 1 INFO (two-finger tap is ML's menu on the EOS M) */
+static CONFIG_INT("moth.key",     cfg_key,     1);    /* what INFO opens: 0 nothing, 1 quick bar, 2 profiles */
 static CONFIG_INT("moth.motion",  cfg_motion,  1);    /* 1 smooth, 0 off */
 static CONFIG_INT("moth.card",    cfg_card,    0);    /* index in card_mb[] (0 = auto) */
 static CONFIG_INT("moth.tally",   cfg_tally,   1);    /* 0 off, 1 frame, 2 pulsing frame */
@@ -72,6 +73,13 @@ static int profiles_from_file;
 static struct bpp_table bpp;
 static struct panel panel;
 static struct panel_view view;
+
+/* the overlay shows one of two things */
+enum { OV_PANEL = 1, OV_BAR = 2 };
+static int ov_mode;
+static struct qbar qbar;
+static struct qbar_view qview;
+static uint32_t qview_read_at;
 
 static uint8_t * back_buf;                  /* the panel's own drawing buffer, only while open */
 static struct canvas back;
@@ -157,21 +165,24 @@ static void mlog(char kind, int code, int a, int b)
 
 static int log_line(char * out, int len, const struct log_ev * e)
 {
-    static const char * pk[] = { "-", "up", "down", "left", "right", "set", "close" };
-    const char * k = (e->a >= 0 && e->a <= 6) ? pk[(int)e->a] : (e->a == PK_CLOSE_NOW ? "close-now" : "?");
+    static const char * pk[] = { "-", "up", "down", "left", "right", "set", "close", "dial-", "dial+" };
+    const char * k = (e->a >= 0 && e->a <= 8) ? pk[(int)e->a] : (e->a == PK_CLOSE_NOW ? "close-now" : "?");
     switch (e->kind)
     {
         case 'K': return snprintf(out, len, "%7d  button 0x%02x%s%s\n", (int)e->t, e->code & 0xffff,
                                   e->b ? " (fake)" : "", e->a ? "" : "   [panel closed]");
         case 'P': return snprintf(out, len, "%7d  portable key %d  -> panel %s, %s\n", (int)e->t, e->code, k,
                                   e->b ? "passed on to Canon" : "kept");
-        case 'O': return snprintf(out, len, "%7d  OPEN  theme %d, %d profiles\n", (int)e->t, e->code, e->a);
+        case 'O': return snprintf(out, len, "%7d  OPEN  %s, theme %d, %d profiles\n", (int)e->t,
+                                  e->b == OV_BAR ? "quick bar" : "profiles", e->code, e->a);
         case 'C': return snprintf(out, len, "%7d  CLOSE %s\n", (int)e->t,
                                   e->code >= 0 && e->code < (int)COUNT(close_why) ? close_why[e->code] : "?");
         case 'R': return snprintf(out, len, "%7d  repaint (something drew over the panel)\n", (int)e->t);
         case 'T': return snprintf(out, len, "%7d  theme -> %d\n", (int)e->t, e->code);
         case 'A': return snprintf(out, len, "%7d  apply step %d (%d)\n", (int)e->t, e->code, e->a);
         case 'L': return snprintf(out, len, "%7d  LiveView %s\n", (int)e->t, e->code ? "back" : "gone");
+        case 'E': return snprintf(out, len, "%7d  quick bar: setting %d %s, %s\n", (int)e->t, e->code,
+                                  e->a > 0 ? "up" : "down", e->b ? "changed" : "unchanged");
     }
     return 0;
 }
@@ -423,6 +434,155 @@ static void apply_poll(uint32_t now)
     }
 }
 
+/* ---------------------------------------------------------------- quick bar: the camera side */
+
+static void copy_str(char * dst, int len, const char * src) { snprintf(dst, len, "%s", src ? src : ""); }
+
+static const char * wb_name(int mode)
+{
+    switch (mode)
+    {
+        case WB_AUTO:        return "AWB";
+        case WB_SUNNY:       return "Daylight";
+        case WB_SHADE:       return "Shade";
+        case WB_CLOUDY:      return "Cloudy";
+        case WB_TUNGSTEN:    return "Tungsten";
+        case WB_FLUORESCENT: return "Fluor.";
+        case WB_FLASH:       return "Flash";
+        case WB_CUSTOM:      return "Custom";
+        default:             return "WB";
+    }
+}
+
+/* what each setting shows; read from ML's lens_info (Canon's own properties) */
+static void qb_fill(struct qbar_view * q)
+{
+    memset(q->item, 0, sizeof(q->item));
+    q->theme = theme();
+    q->reduced_motion = !cfg_motion;
+
+    struct qb_item_view * it = &q->item[QB_SHUTTER];
+    if (lens_info.raw_shutter)
+    {
+        int s = get_current_shutter_reciprocal_x1000();
+        int fps = fps_get_current_x1000();
+        copy_str(it->value, sizeof(it->value), lens_format_shutter_reciprocal(s, 3));
+        int deg = s > 0 ? (3600 * (fps / 10) / (s / 10) + 5) / 10 : 0;   /* shutter angle */
+        snprintf(it->sub, sizeof(it->sub), "%d deg", deg);   /* green near 180: natural motion */
+        it->sub_tone = deg >= 170 && deg <= 190 ? QT_OK : (deg < 45 || deg > 300) ? QT_EDGE : QT_DIM;
+    }
+    else
+    {
+        copy_str(it->value, sizeof(it->value), "Auto");
+        copy_str(it->sub, sizeof(it->sub), "auto (Canon)");
+        it->locked = 1;
+    }
+
+    it = &q->item[QB_APERTURE];
+    if (!lens_info.lens_exists)
+    {
+        copy_str(it->value, sizeof(it->value), "Lens");
+        copy_str(it->sub, sizeof(it->sub), "manual lens");
+        it->locked = 1;
+    }
+    else if (!lens_info.raw_aperture)
+    {
+        copy_str(it->value, sizeof(it->value), "Auto");
+        copy_str(it->sub, sizeof(it->sub), "auto (Canon)");
+        it->locked = 1;
+    }
+    else
+    {
+        char lo[12], hi[12];
+        copy_str(it->value, sizeof(it->value), lens_format_aperture(lens_info.raw_aperture));
+        copy_str(lo, sizeof(lo), lens_format_aperture(lens_info.raw_aperture_min));
+        copy_str(hi, sizeof(hi), lens_format_aperture(lens_info.raw_aperture_max));
+        snprintf(it->sub, sizeof(it->sub), "%s - %s", lo, hi[0] == 'f' && hi[1] == '/' ? hi + 2 : hi);
+    }
+
+    it = &q->item[QB_ISO];
+    if (lens_info.raw_iso)
+    {
+        copy_str(it->value, sizeof(it->value), lens_format_iso(lens_info.raw_iso));
+        copy_str(it->sub, sizeof(it->sub), "manual");
+    }
+    else
+    {
+        copy_str(it->value, sizeof(it->value), "Auto");
+        copy_str(it->sub, sizeof(it->sub), "dial: manual");
+        it->sub_tone = QT_ACCENT;
+    }
+
+    it = &q->item[QB_WB];
+    if (lens_info.wb_mode == WB_KELVIN)
+    {
+        snprintf(it->value, sizeof(it->value), "%dK", (int)lens_info.kelvin);
+        copy_str(it->sub, sizeof(it->sub), "Kelvin");
+    }
+    else
+    {
+        copy_str(it->value, sizeof(it->value), wb_name(lens_info.wb_mode));
+        copy_str(it->sub, sizeof(it->sub), "dial: Kelvin");
+        it->sub_tone = QT_ACCENT;
+    }
+
+    it = &q->item[QB_PROFILE];
+    if (cfg_active >= 0 && cfg_active < profile_count)
+    {
+        const struct rec_profile * p = &profiles[cfg_active];
+        copy_str(it->value, sizeof(it->value), p->name);
+        if (p->mood == MOOD_OFF) { copy_str(it->sub, sizeof(it->sub), "Canon H.264"); }
+        else
+        {
+            int is_auto;
+            int card = card_kBps(&is_auto);
+            int need = budget_kBps(live_fmt.width > 0 ? &live_fmt : &p->nominal, &bpp);
+            enum budget_verdict vd = budget_verdict(need, card);
+            int mins = budget_minutes_on_card(need, free_MB());
+            const char * w = vd == BUDGET_CONTINUOUS ? "OK" : vd == BUDGET_MARGINAL ? "EDGE" : "BURST";
+            if (mins >= 0) snprintf(it->sub, sizeof(it->sub), "%s  ~%d min", w, mins);
+            else           snprintf(it->sub, sizeof(it->sub), "%s", w);
+            it->sub_tone = vd == BUDGET_CONTINUOUS ? QT_OK : vd == BUDGET_MARGINAL ? QT_EDGE : QT_BURST;
+        }
+    }
+    else
+    {
+        copy_str(it->value, sizeof(it->value), "Choose");
+        copy_str(it->sub, sizeof(it->sub), "SET: profiles");
+        it->sub_tone = QT_ACCENT;
+    }
+}
+
+/* one dial click. ML's own steppers: Canon's valid steps, the lens's range, no wrap-around
+   (priv -1, the "shortcut" mode Crop Mood uses for its ISO / aperture buttons). They wait
+   for Canon to confirm, so they run here in the panel's task, never in the GUI task. */
+static void qb_adjust(int item, int sign, uint32_t now)
+{
+    int before, after;
+    switch (item)
+    {
+        case QB_SHUTTER:  before = lens_info.raw_shutter;  shutter_toggle((void *)-1, sign);  after = lens_info.raw_shutter;  break;
+        case QB_APERTURE: before = lens_info.raw_aperture; aperture_toggle((void *)-1, sign); after = lens_info.raw_aperture; break;
+        case QB_ISO:      before = lens_info.raw_iso;      iso_toggle((void *)-1, sign);      after = lens_info.raw_iso;      break;
+        case QB_WB:
+            before = lens_info.wb_mode == WB_KELVIN ? (int)lens_info.kelvin : -1;
+            kelvin_toggle((void *)-1, sign);
+            after = lens_info.wb_mode == WB_KELVIN ? (int)lens_info.kelvin : -1;
+            break;
+        default: return;
+    }
+    mlog('E', item, sign, before == after ? 0 : 1);
+    if (before == after)
+        qbar_toast(&qbar, item == QB_ISO && !lens_info.raw_shutter ? "ISO is automatic: set Movie exposure to Manual (Canon menu)"
+                                                                   : "That is the limit", 0, now);
+}
+
+static const char * qb_locked_reason(int item)
+{
+    if (item == QB_APERTURE && !lens_info.lens_exists) return "Manual lens: set the aperture on the lens";
+    return "Automatic: in Canon's menu set Movie exposure to Manual";
+}
+
 /* ---------------------------------------------------------------- the overlay */
 
 static void present(const struct present * o)
@@ -458,6 +618,23 @@ static void present_full(void)
         memcpy(front + y * BMPPITCH, back.px + y * back.pitch, UI_W);
 }
 
+static void present_rows(int y0, int y1)
+{
+    uint8_t * front = bmp_vram_real();
+    if (!front || !back_buf) return;
+    for (int y = y0; y < y1; y++)
+        memcpy(front + y * BMPPITCH, back.px + y * back.pitch, UI_W);
+}
+
+static int rows_disturbed(int y0, int y1)
+{
+    uint8_t * front = bmp_vram_real();
+    if (!front || !back_buf) return 0;
+    for (int y = y0 + 1; y < y1; y += 4)
+        if (memcmp(front + y * BMPPITCH, back.px + y * back.pitch, UI_W)) return 1;
+    return 0;
+}
+
 static int overlay_begin(void)
 {
     /* the panel's own full-screen buffer (338 KB), allocated only while the panel is open */
@@ -468,6 +645,7 @@ static int overlay_begin(void)
     back.bx0 = 0; back.bx1 = UI_W;
     back.by0 = 0; back.by1 = UI_H;
     gfx_clip_all(&back);
+    memset(back_buf, 0, UI_W * UI_H);       /* transparent: the quick bar only draws its rows */
 
     /* ML's overlays step aside while the panel is up; Canon stops redrawing its own */
     saved_global_draw = menu_get_value_from_script("Overlay", "Global Draw");
@@ -493,7 +671,9 @@ static void overlay_end(int why)
     closed_at = get_ms_clock();
     release_gui_state();
     overlay_active = 0;
+    ov_mode = 0;
     panel.state = PS_CLOSED;
+    qbar.state = QB_CLOSED;
     apply_phase = 0;                        /* an apply cut short is not resumed on the next open */
     keys_released = 0;
     if (saved_global_draw > 0) menu_set_value_from_script("Overlay", "Global Draw", saved_global_draw);
@@ -628,13 +808,24 @@ static void moth_task(void)
 
         if (open_request && !overlay_active)
         {
+            int mode = open_request;
             opening = 1;
             open_request = 0;
             if (can_show_panel() && overlay_begin())
             {
-                fill_view();
-                panel_open(&panel, &view, get_ms_clock());
-                mlog('O', cfg_theme, profile_count, 0);
+                ov_mode = mode;
+                if (mode == OV_BAR)
+                {
+                    qb_fill(&qview);
+                    qbar_open(&qbar, &qview, get_ms_clock());
+                    qview_read_at = get_ms_clock();
+                }
+                else
+                {
+                    fill_view();
+                    panel_open(&panel, &view, get_ms_clock());
+                }
+                mlog('O', cfg_theme, profile_count, mode);
                 was_lv = lv;
             }
             open_request = 0;               /* an INFO that arrived while starting up is not a new request */
@@ -646,6 +837,76 @@ static void moth_task(void)
         {
             /* the watchdog gave the buttons back while we were stuck: tidy up quietly */
             overlay_end(CLOSE_WATCHDOG);
+            continue;
+        }
+
+        if (overlay_active && ov_mode == OV_BAR)
+        {
+            int k, closed = 0, to_panel = 0;
+            while ((k = pop_key()) != PK_NONE)
+            {
+                repaint_until = now + 300;
+                if (k == PK_CLOSE_NOW) { overlay_end(CLOSE_KEY_PASS); closed = 1; break; }
+                int act = qbar_key(&qbar, &qview, k, now);
+                if (act == QA_ADJUST)
+                {
+                    qb_adjust(qbar.adj_item, qbar.adj_sign, now);
+                    now = get_ms_clock();       /* Canon took its time */
+                    qb_fill(&qview);
+                    qbar_changed(&qbar);
+                    qview_read_at = now;
+                }
+                if (act == QA_LOCKED) qbar_toast(&qbar, qb_locked_reason(qbar.adj_item), 0, now);
+                if (act == QA_OPEN_PANEL) { to_panel = 1; break; }
+            }
+            if (closed) continue;
+
+            if (to_panel)
+            {
+                /* the profile list, in place: same overlay, the bar's rows cleared first */
+                memset(back_buf, 0, UI_W * UI_H);
+                present_rows(QB_TOP, UI_H);
+                qbar.state = QB_CLOSED;
+                ov_mode = OV_PANEL;
+                fill_view();
+                panel_open(&panel, &view, now);
+                mlog('O', cfg_theme, profile_count, OV_PANEL);
+                continue;
+            }
+
+            /* Canon can change values itself (auto ISO, a lens swap): look 4 times a second */
+            if (now - qview_read_at > 250)
+            {
+                static struct qbar_view fresh;
+                qb_fill(&fresh);
+                if (memcmp(fresh.item, qview.item, sizeof(fresh.item))) { qview = fresh; qbar_changed(&qbar); }
+                qview_read_at = now;
+            }
+
+            if (!lv != !was_lv) { mlog('L', lv ? 1 : 0, 0, 0); was_lv = lv; }
+            int why = gui_menu_shown() ? CLOSE_MENU : RECORDING ? CLOSE_REC :
+                      !is_movie_mode() ? CLOSE_PHOTO : !display_is_on() ? CLOSE_DISPLAY : 0;
+            if (!lv)
+            {
+                if (!lv_lost_at) lv_lost_at = now ? now : 1;
+                if (now - lv_lost_at > 700u) why = CLOSE_LV;
+            }
+            else lv_lost_at = 0;
+            if (why) { overlay_end(why); continue; }
+
+            struct present out;
+            last_frame_ms = now;
+            int fl = qbar_frame(&qbar, &qview, &back, now, &out);
+            if (fl & PF_PRESENTED) present(&out);
+            if (qbar_settled(&qbar))
+            {
+                /* only the bar's own rows (and its strip) are ours; LiveView shows above */
+                int y0 = qbar.strip_shown ? QB_STRIP_Y : QB_Y;
+                if ((int32_t)(repaint_until - now) > 0) present_rows(y0, UI_H);
+                else if (rows_disturbed(y0, UI_H)) { present_rows(y0, UI_H); mlog('R', 0, 0, 0); }
+            }
+            if (fl & PF_CLOSED) overlay_end(CLOSE_KEY);
+            msleep(20);
             continue;
         }
 
@@ -752,7 +1013,7 @@ static unsigned int moth_keypress_cbr(unsigned int key)
         return r.pass_to_canon;
     }
 
-    int trigger = cfg_key == 1 && key == MODULE_KEY_INFO;
+    int trigger = cfg_key && key == MODULE_KEY_INFO;
     if (trigger && (opening || open_request)) return 0;     /* already on its way */
     if (trigger && lv && !is_movie_mode() && !gui_menu_shown())
     {
@@ -764,7 +1025,7 @@ static unsigned int moth_keypress_cbr(unsigned int key)
     if (trigger && can_show_panel())
     {
         key_head = key_tail = 0;
-        open_request = 1;
+        open_request = cfg_key == 2 ? OV_PANEL : OV_BAR;
         return 0;
     }
     return 1;
@@ -802,7 +1063,7 @@ static unsigned int moth_keypress_raw_cbr(unsigned int raw)
 
 static MENU_SELECT_FUNC(open_from_menu)
 {
-    open_request = 1;
+    open_request = OV_PANEL;
     gui_stop_menu();            /* the task opens the panel once the ML menu has closed */
 }
 
@@ -854,10 +1115,10 @@ static struct menu_entry moth_menu[] =
                 .help = "How the panel looks. Takes effect the next time the panel opens.",
             },
             {
-                .name = "Panel key", .priv = &cfg_key, .max = 1,
-                .choices = CHOICES("OFF", "INFO"),
-                .help = "INFO opens the panel in LiveView (movie mode, not recording).",
-                .help2 = "OFF gives INFO back to Canon; open the panel from this menu instead.",
+                .name = "INFO opens", .priv = &cfg_key, .max = 2,
+                .choices = CHOICES("nothing", "Quick bar", "Profiles"),
+                .help = "Quick bar: shutter, aperture, ISO, WB and profile over LiveView.",
+                .help2 = "Profiles: the profile list directly. 'nothing' gives INFO back to Canon.",
             },
             {
                 .name = "Animations", .priv = &cfg_motion, .max = 1,

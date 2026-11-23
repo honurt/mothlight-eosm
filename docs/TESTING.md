@@ -46,6 +46,16 @@ in the release notes.
 - [ ] After applying, pressing UP/DOWN dismisses the result and keeps the panel open
 - [ ] The ML menu (two-finger tap) still opens normally when the panel is closed
 
+### Quick bar (INFO, default)
+
+- [ ] INFO in movie mode opens the bar at the bottom; LiveView stays visible above it
+- [ ] UP / DOWN move between SHUTTER, APERTURE, ISO, WB, PROFILE; the rear dial changes the value
+- [ ] Shutter shows its angle (green near 180); aperture shows the lens range
+- [ ] With Canon's Movie exposure on Auto, SHUTTER / APERTURE say "auto (Canon)" and the dial explains why
+- [ ] A manual (adapted) lens: APERTURE says so
+- [ ] SET (or the dial) on PROFILE opens the profile list; INFO closes; REC starts RAW
+- [ ] No black flash on DOWN or SET
+
 ### Applying
 
 For each built-in profile:

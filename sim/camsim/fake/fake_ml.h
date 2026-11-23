@@ -14,7 +14,11 @@ struct cam_state
 {
     int lv_on, dispsize, recording, raw, movie, menu_shown, display_on, front_enabled;
     int playback, canon_menu;
-    struct { int focal_len; } lens;
+    struct {
+        int focal_len, lens_exists;
+        int raw_shutter, raw_aperture, raw_aperture_min, raw_aperture_max, raw_iso, aperture;
+        unsigned wb_mode, kelvin;
+    } lens;
 };
 extern struct cam_state cam;
 extern int gui_state;                       /* ML's copy of Canon's GUI state: 0 = idle */
@@ -85,6 +89,24 @@ struct font { const void * bitmap; };
 extern struct font font_dynamic[];
 void task_create(const char * name, int prio, int stack, void * fn, void * arg);
 #define CBR_RET_ERROR 1
+
+#define WB_AUTO 0
+#define WB_SUNNY 1
+#define WB_SHADE 8
+#define WB_CLOUDY 2
+#define WB_TUNGSTEN 3
+#define WB_FLUORESCENT 4
+#define WB_FLASH 5
+#define WB_CUSTOM 6
+#define WB_KELVIN 9
+void shutter_toggle(void * priv, int sign);
+void aperture_toggle(void * priv, int sign);
+void iso_toggle(void * priv, int sign);
+void kelvin_toggle(void * priv, int sign);
+const char * lens_format_shutter_reciprocal(int x1000, int digits);
+const char * lens_format_aperture(int raw);
+const char * lens_format_iso(int raw);
+int get_current_shutter_reciprocal_x1000(void);
 
 struct event { int type; int param; void * obj; int arg; };
 #define FAKE_BTN 0x7E57

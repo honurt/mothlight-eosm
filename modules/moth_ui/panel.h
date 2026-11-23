@@ -20,7 +20,8 @@
 #include "profiles.h"
 #include "themes.h"
 
-enum panel_key   { PK_NONE, PK_UP, PK_DOWN, PK_LEFT, PK_RIGHT, PK_SET, PK_CLOSE };
+enum panel_key   { PK_NONE, PK_UP, PK_DOWN, PK_LEFT, PK_RIGHT, PK_SET, PK_CLOSE,
+                   PK_WHEEL_PREV, PK_WHEEL_NEXT };   /* the rear dial (the panel treats it like UP / DOWN) */
 enum panel_act   { PA_NONE, PA_APPLY, PA_CLOSED_BY_USER, PA_THEME_PREV, PA_THEME_NEXT };
 enum panel_state { PS_CLOSED, PS_OPENING, PS_OPEN, PS_APPLYING, PS_DONE, PS_CLOSING };
 

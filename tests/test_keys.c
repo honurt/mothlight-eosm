@@ -33,7 +33,8 @@ int main(void)
           "LEFT is kept from Canon and does nothing");
 
     const int wheel[] = { MODULE_KEY_WHEEL_RIGHT, MODULE_KEY_WHEEL_RIGHT, MODULE_KEY_WHEEL_LEFT };
-    CHECK(run(wheel, 3, nav, &nn) == 0 && nn == 3 && nav[2] == PK_UP, "rear wheel scrolls");
+    CHECK(run(wheel, 3, nav, &nn) == 0 && nn == 3 && nav[0] == PK_WHEEL_NEXT && nav[2] == PK_WHEEL_PREV,
+          "rear dial gives its own keys (the list scrolls with them, the quick bar changes values)");
 
     const int touch[] = { MODULE_KEY_TOUCH_1_FINGER, 0, MODULE_KEY_UNTOUCH_1_FINGER };
     CHECK(run(touch, 3, nav, &nn) == 0, "a stray touch must not close the panel");

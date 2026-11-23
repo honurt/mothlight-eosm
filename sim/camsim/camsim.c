@@ -187,6 +187,19 @@ static void run_for(int ms)
 
 /* ML's long-press ring (x 655-685, y 328-358) is ML's own UI while DOWN is held: allowed there */
 static int ring_active;
+/* what part of the screen the overlay owns, and whether it is fully up */
+static int ov_owned_top(void)
+{
+    if (ov_mode == OV_BAR) return qbar.strip_shown ? QB_STRIP_Y : QB_Y;
+    return 0;
+}
+static int ov_settled(void)
+{
+    if (!overlay_active || !back_buf) return 0;
+    if (ov_mode == OV_BAR) return qbar_settled(&qbar);
+    return panel_settled(&panel);
+}
+
 static int row_differs(int y)
 {
     const uint8_t * a = bmp + y * BMPPITCH, * b = back.px + y * back.pitch;
@@ -203,10 +216,10 @@ static int worst_overdraw;
 static void check_visible(void)
 {
     /* a stalled panel task cannot repaint (that is what the watchdog is for) */
-    if (!(overlay_active && back_buf && panel_settled(&panel)) || tasks[0].blocked || keys_released)
+    if (!ov_settled() || tasks[0].blocked || keys_released)
     { overdrawn_since = 0; return; }
     int diff = 0;
-    for (int y = 1; y < UI_H && !diff; y += 6) diff = row_differs(y);
+    for (int y = ov_owned_top() + 1; y < UI_H && !diff; y += 6) diff = row_differs(y);
     if (!diff) { overdrawn_since = 0; return; }
     if (!overdrawn_since) overdrawn_since = now_ms;
     int d = now_ms - overdrawn_since;
@@ -498,6 +511,60 @@ void bmp_fill(uint8_t col, int x, int y, int w, int h)
     for (int r = y; r < y + h; r++) memset(bmp + r * BMPPITCH + x, col, w);
 }
 
+/* the lens and exposure, Canon-like: third stops, limits, auto exposure, manual lenses.
+   Like ML's steppers, each change waits for Canon to confirm (~40 ms). */
+static const int shutters[] = { 33, 40, 50, 60, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000 };
+static const int fstops10[] = { 14, 16, 18, 20, 22, 25, 28, 32, 35, 40, 45, 50, 56, 63, 71, 80, 90, 100, 110, 130, 140, 160, 180, 200, 220 };
+static const int isos[] = { 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400 };
+static int sh_i = 2, ap_i = 6, iso_i = 9, auto_expo, lens_min_i = 0, lens_max_i = 21;
+static int lens_changes;
+static void lens_sync(void)
+{
+    cam.lens.raw_shutter = auto_expo ? 0 : 56 + sh_i * 3;
+    cam.lens.raw_aperture = auto_expo || !cam.lens.lens_exists ? 0 : 10 + ap_i * 3;
+    cam.lens.aperture = cam.lens.raw_aperture ? fstops10[ap_i] : 0;
+    cam.lens.raw_aperture_min = 10 + lens_min_i * 3;
+    cam.lens.raw_aperture_max = 10 + lens_max_i * 3;
+}
+static int step(int * i, int n, int sign, int lo, int hi)
+{
+    int j = *i + sign;
+    if (j < lo || j > hi || j >= n) return 0;
+    *i = j; lens_changes++; return 1;
+}
+void shutter_toggle(void * priv, int sign) { if (!cam.lens.raw_shutter) return; cam_block(40); step(&sh_i, COUNT(shutters), sign, 0, COUNT(shutters) - 1); lens_sync(); }
+void aperture_toggle(void * priv, int sign) { if (!cam.lens.lens_exists || !cam.lens.raw_aperture) return; cam_block(40); step(&ap_i, COUNT(fstops10), sign, lens_min_i, lens_max_i); lens_sync(); }
+void iso_toggle(void * priv, int sign)
+{
+    if (auto_expo) return;                  /* Canon keeps ISO automatic in auto movie exposure */
+    cam_block(40);
+    if (!cam.lens.raw_iso) { iso_i = 0; cam.lens.raw_iso = 72; lens_changes++; return; }
+    if (step(&iso_i, COUNT(isos), sign, 0, COUNT(isos) - 1)) cam.lens.raw_iso = 72 + iso_i * 3;
+}
+void kelvin_toggle(void * priv, int sign)
+{
+    int k = cam.lens.wb_mode == WB_KELVIN ? (int)cam.lens.kelvin : 5200;
+    int st = k + sign * 100 > 7000 ? 500 : 100;
+    k = (k / st) * st + sign * st;
+    if (k < 1500) k = 1500;
+    if (k > 15000) k = 15000;
+    cam_block(40);
+    if (cam.lens.wb_mode != WB_KELVIN || (int)cam.lens.kelvin != k) lens_changes++;
+    cam.lens.wb_mode = WB_KELVIN; cam.lens.kelvin = k;
+}
+int get_current_shutter_reciprocal_x1000(void) { return shutters[sh_i] * 1000; }
+const char * lens_format_shutter_reciprocal(int x1000, int digits) { static char b[16]; snprintf(b, sizeof(b), "1/%d", x1000 / 1000); return b; }
+const char * lens_format_aperture(int raw)
+{
+    static char b[16];
+    int i = (raw - 10) / 3;
+    if (i < 0) i = 0;
+    if (i >= COUNT(fstops10)) i = COUNT(fstops10) - 1;
+    snprintf(b, sizeof(b), "f/%d.%d", fstops10[i] / 10, fstops10[i] % 10);
+    return b;
+}
+const char * lens_format_iso(int raw) { static char b[16]; if (!raw) return "Auto"; snprintf(b, sizeof(b), "%d", isos[(raw - 72) / 3]); return b; }
+
 /* the heap: sizes are kept in a header so leaks can be counted */
 void * cam_malloc(size_t n)
 {
@@ -582,10 +649,10 @@ static int was_overlay;
 static void post_frame_checks(void)
 {
     frames_checked++;
-    int settled = overlay_active && panel_settled(&panel);
+    int settled = ov_settled();
     if (settled && back_buf)
     {
-        for (int y = 0; y < UI_H; y++)
+        for (int y = ov_owned_top(); y < UI_H; y++)
             if (row_differs(y))
             {
                 settled_mismatch++;
@@ -621,6 +688,11 @@ static void boot(void)
     memset(&cam, 0, sizeof(cam));
     cam.lv_on = 1; cam.movie = 1; cam.display_on = 1; cam.front_enabled = 1; cam.dispsize = 1;
     cam.lens.focal_len = 22;
+    cam.lens.lens_exists = 1;
+    cam.lens.raw_iso = 72 + iso_i * 3;
+    cam.lens.wb_mode = WB_KELVIN; cam.lens.kelvin = 5600;
+    lens_sync();
+    if (!getenv("KEEP_KEY")) cfg_key = 2;   /* most scenarios test the profile panel; bar ones set 1 */
     bmp = cam_malloc(BMPPITCH * 480);
     heap_live = 0;                          /* the screen is not the module's */
     memset(bmp, 0, BMPPITCH * 480);
@@ -693,7 +765,7 @@ static void select_profile(int idx);
 static int screen_says(const char * text)
 {
     ui_text_drawn_reset();
-    panel.full_redraw = 1;
+    if (ov_mode == OV_BAR) qbar.full_redraw = 1; else panel.full_redraw = 1;
     run_for(60);
     return strstr(ui_text_drawn, text) != 0;
 }
@@ -836,6 +908,136 @@ static void s_two_finger_while_open(void)
     EXPECT(!overlay_active, "panel still up after a two-finger tap");
     EXPECT(cam.menu_shown, "two-finger tap with the panel open did not open ML's menu");
     cam.menu_shown = 0;
+    finish();
+}
+
+/* ---------------------------------------------------------------- quick bar */
+
+static void open_bar(void)
+{
+    cfg_key = 1;
+    tap(K_INFO, 0);
+    run_for(600);
+    EXPECT(overlay_active && ov_mode == OV_BAR && qbar.state == QB_OPEN, "INFO did not open the quick bar (mode %d state %d)", ov_mode, qbar.state);
+}
+
+static void bar_select(int item)
+{
+    for (int i = 0; i < QB_COUNT && qbar.sel != item; i++) { tap(K_DOWN, 30); run_for(60); }
+    EXPECT(qbar.sel == item, "could not select bar item %d (sel %d)", item, qbar.sel);
+}
+
+static void s_qbar_basic(void)
+{
+    boot(); open_bar();
+    EXPECT(screen_says("SHUTTER") && screen_says("1/50") && screen_says("f/2.8") && screen_says("800") && screen_says("5600K"),
+           "bar does not show the camera's values:\n%s", ui_text_drawn);
+    EXPECT(screen_says("UP / DOWN choose"), "no hint after opening");
+    /* LiveView above the bar stays untouched (transparent) */
+    int dirty_above = 0;
+    for (int y = 0; y < QB_STRIP_Y && !dirty_above; y += 3)
+        for (int x = 0; x < UI_W; x += 7) if (bmp[y * BMPPITCH + x]) { dirty_above = 1; break; }
+    EXPECT(!dirty_above, "the bar drew above its area (LiveView should show there)");
+
+    bar_select(QB_SHUTTER);
+    tap(K_WR, 0); run_for(200);
+    EXPECT(sh_i == 3 && screen_says("1/60"), "dial on SHUTTER: index %d\n%s", sh_i, ui_text_drawn);
+    bar_select(QB_APERTURE);
+    tap(K_WL, 0); tap(K_WL, 0); run_for(300);
+    EXPECT(ap_i == 4 && screen_says("f/2.2"), "dial on APERTURE: index %d", ap_i);
+    bar_select(QB_ISO);
+    tap(K_WR, 0); run_for(200);
+    EXPECT(iso_i == 10 && screen_says("1000"), "dial on ISO: index %d", iso_i);
+    bar_select(QB_WB);
+    tap(K_WL, 0); run_for(200);
+    EXPECT(cam.lens.kelvin == 5500 && screen_says("5500K"), "dial on WB: %uK", cam.lens.kelvin);
+    EXPECT(!canon_got[K_WR] && !canon_got[K_WL] && !canon_got[K_DOWN], "bar keys leaked to Canon");
+    printf("    worst overdraw with the bar: %d ms\n", worst_overdraw);
+    tap(K_INFO, 0); run_for(400);
+    EXPECT(!overlay_active && gui_state == 0, "INFO did not close the bar cleanly");
+    finish();
+}
+
+static void s_qbar_locked(void)
+{
+    auto_expo = 1;
+    boot(); open_bar();
+    EXPECT(screen_says("Auto") && screen_says("auto (Canon)"), "auto exposure not shown:\n%s", ui_text_drawn);
+    bar_select(QB_SHUTTER);
+    tap(K_WR, 0); run_for(200);
+    EXPECT(lens_changes == 0 && screen_says("Movie exposure to Manual"), "dial on automatic shutter: no explanation\n%s", ui_text_drawn);
+    bar_select(QB_ISO);
+    tap(K_WR, 0); run_for(200);
+    EXPECT(screen_says("ISO is automatic"), "dial on automatic ISO: no explanation\n%s", ui_text_drawn);
+    tap(K_INFO, 0); run_for(400);
+    auto_expo = 0; lens_sync();
+    cam.lens.lens_exists = 0; lens_sync();  /* a manual (adapted) lens */
+    open_bar();
+    bar_select(QB_APERTURE);
+    tap(K_WR, 0); run_for(200);
+    EXPECT(screen_says("Manual lens"), "dial on a manual lens: no explanation\n%s", ui_text_drawn);
+    finish();
+}
+
+static void s_qbar_limits(void)
+{
+    boot(); open_bar();
+    bar_select(QB_APERTURE);
+    for (int i = 0; i < 12; i++) { tap(K_WL, 0); run_for(60); }
+    EXPECT(ap_i == lens_min_i, "aperture went past the lens (index %d)", ap_i);
+    EXPECT(screen_says("That is the limit"), "no message at the lens limit\n%s", ui_text_drawn);
+    finish();
+}
+
+static void s_qbar_to_panel(void)
+{
+    boot(); open_bar();
+    bar_select(QB_PROFILE);
+    tap(K_SET, 40); run_for(800);
+    EXPECT(overlay_active && ov_mode == OV_PANEL && panel.state == PS_OPEN, "SET on PROFILE did not open the profiles (mode %d)", ov_mode);
+    int idx = find_profile(MOOD_1X1);
+    select_profile(idx);
+    tap(K_SET, 40); run_for(2500);
+    EXPECT(cfg_active == idx, "apply from the bar's panel failed (active %d)", cfg_active);
+    run_for(2500);
+    open_bar();
+    EXPECT(screen_says(profiles[idx].name), "bar does not show the profile in use\n%s", ui_text_drawn);
+    finish();
+}
+
+static void s_qbar_rec(void)
+{
+    boot();
+    select_profile(0);                      /* (panel closed: no-op) */
+    open_panel(); select_profile(find_profile(MOOD_1X1)); tap(K_SET, 40); run_for(4000);
+    open_bar();
+    tap(K_REC, 0); run_for(300);
+    EXPECT(raw_recordings == 1 && !overlay_active, "REC with the bar open: %d RAW, overlay %d", raw_recordings, overlay_active);
+    cam.recording = 0; run_for(3500);
+    finish();
+}
+
+static void s_qbar_external(void)
+{
+    boot(); open_bar();
+    iso_i = 14; cam.lens.raw_iso = 72 + iso_i * 3;     /* Canon changed it (auto ISO, a remote ...) */
+    run_for(400);
+    EXPECT(screen_says("2500"), "bar did not follow a value Canon changed\n%s", ui_text_drawn);
+    finish();
+}
+
+static void s_qbar_themes(void)
+{
+    boot();
+    for (int t = 0; t < THEME_COUNT; t++)
+    {
+        cfg_theme = t;
+        open_bar();
+        ui_text_overflows = 0;
+        qbar.full_redraw = 1; run_for(60);
+        EXPECT(ui_text_overflows == 0, "theme %s: bar text does not fit: %s", moth_themes[t].name, ui_text_overflow_last);
+        tap(K_INFO, 0); run_for(400);
+    }
     finish();
 }
 
@@ -1276,12 +1478,13 @@ static void s_soak(void)
         else if (r < 89) { stall_zoom_ms = 0; }
         else if (r < 90) { ui_stall_once = 1000 + rand() % 2500; }
         else if (r < 91) { canon_periodic_ms = canon_periodic_ms ? 0 : 900; }
+        else if (r < 93) { cfg_key = 1 + rand() % 2; }   /* INFO opens the bar or the profiles */
         run_for(rand() % 150);
         if (overlay_active) opens++;
         /* keep the world able to show the panel most of the time */
         if (rand() % 10 == 0) { cam.movie = 1; cam.playback = 0; cam.lv_on = 1; cam.recording = 0; cam.menu_shown = 0; }
     }
-    stall_zoom_ms = 0; canon_periodic_ms = 0;
+    stall_zoom_ms = 0; canon_periodic_ms = 0; cfg_key = 2;
     cam.movie = 1; cam.playback = 0; cam.lv_on = 1; cam.recording = 0; cam.menu_shown = 0; cam.display_on = 1;
     run_for(7000);
     if (overlay_active) close_panel();
@@ -1361,6 +1564,13 @@ static const struct sc all[] = {
     { "ML's gui_state held while open: no long-press flash on DOWN/SET", s_gui_state },
     { "REC with the panel open starts RAW (MLV Lite), not H.264", s_rec_raw_while_open },
     { "two-finger tap with the panel open: close and open ML's menu", s_two_finger_while_open },
+    { "quick bar: values, dial changes each setting, LiveView left alone", s_qbar_basic },
+    { "quick bar: auto exposure, auto ISO, manual lens explained", s_qbar_locked },
+    { "quick bar: lens limits", s_qbar_limits },
+    { "quick bar: SET on PROFILE opens the profiles, then back", s_qbar_to_panel },
+    { "quick bar: REC starts RAW", s_qbar_rec },
+    { "quick bar: follows values Canon changes", s_qbar_external },
+    { "quick bar: every theme, text fits", s_qbar_themes },
     { "all themes, both directions", s_themes_all },
     { "600 random keys incl. touch and unknown events", s_key_mash },
     { "keys during open/close animations", s_keys_during_animations },

@@ -20,10 +20,13 @@ static inline struct key_route moth_route_key(int key)
     struct key_route r = { PK_NONE, 1 };
     switch (key)
     {
-        case MODULE_KEY_WHEEL_UP: case MODULE_KEY_WHEEL_LEFT: case MODULE_KEY_PRESS_UP:
-            r.panel_key = PK_UP;    r.pass_to_canon = 0; break;
-        case MODULE_KEY_WHEEL_DOWN: case MODULE_KEY_WHEEL_RIGHT: case MODULE_KEY_PRESS_DOWN:
-            r.panel_key = PK_DOWN;  r.pass_to_canon = 0; break;
+        case MODULE_KEY_PRESS_UP:   r.panel_key = PK_UP;   r.pass_to_canon = 0; break;
+        case MODULE_KEY_PRESS_DOWN: r.panel_key = PK_DOWN; r.pass_to_canon = 0; break;
+        /* the rear dial: scrolls the profile list, changes the value in the quick bar */
+        case MODULE_KEY_WHEEL_UP: case MODULE_KEY_WHEEL_LEFT:
+            r.panel_key = PK_WHEEL_PREV; r.pass_to_canon = 0; break;
+        case MODULE_KEY_WHEEL_DOWN: case MODULE_KEY_WHEEL_RIGHT:
+            r.panel_key = PK_WHEEL_NEXT; r.pass_to_canon = 0; break;
         /* LEFT / RIGHT do nothing in the panel: on the EOS M, Canon takes RIGHT in LiveView
            before ML sees it (only its release and an "info changed" event arrive), so they
            cannot be relied on. Kept from Canon while the panel is up. */

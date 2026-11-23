@@ -1,6 +1,6 @@
 # Mothlight UI module. Builds inside either engine tree (scripts/build.sh copies it there).
 MODULE_NAME = moth_ui
-SRCS = moth_ui.o panel.o themes.o ui_gfx.o ui_text.o budget.o profiles.o
+SRCS = moth_ui.o panel.o qbar.o themes.o ui_gfx.o ui_text.o budget.o profiles.o
 
 ifneq ($(wildcard ../Makefile.modules),)
     # Crop Mood engine (2023-era build system)
