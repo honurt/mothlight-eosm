@@ -24,8 +24,11 @@ static inline struct key_route moth_route_key(int key)
             r.panel_key = PK_UP;    r.pass_to_canon = 0; break;
         case MODULE_KEY_WHEEL_DOWN: case MODULE_KEY_WHEEL_RIGHT: case MODULE_KEY_PRESS_DOWN:
             r.panel_key = PK_DOWN;  r.pass_to_canon = 0; break;
-        case MODULE_KEY_PRESS_LEFT:  r.panel_key = PK_LEFT;  r.pass_to_canon = 0; break;
-        case MODULE_KEY_PRESS_RIGHT: r.panel_key = PK_RIGHT; r.pass_to_canon = 0; break;
+        /* LEFT / RIGHT do nothing in the panel: on the EOS M, Canon takes RIGHT in LiveView
+           before ML sees it (only its release and an "info changed" event arrive), so they
+           cannot be relied on. Kept from Canon while the panel is up. */
+        case MODULE_KEY_PRESS_LEFT: case MODULE_KEY_PRESS_RIGHT:
+            r.pass_to_canon = 0; break;
         case MODULE_KEY_PRESS_SET:   r.panel_key = PK_SET;   r.pass_to_canon = 0; break;
 
         case MODULE_KEY_PRESS_HALFSHUTTER: case MODULE_KEY_PRESS_FULLSHUTTER:

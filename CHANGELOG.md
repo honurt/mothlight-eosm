@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.2 (second camera test, 24 Nov 2026)
+
+From the camera's own event log (ML/LOGS/MOTHLOG.TXT):
+- RIGHT never reaches ML in LiveView on the EOS M (Canon acts on it; only its release and
+  "info changed" arrive), and LEFT showed up as half-shutter. Themes are no longer on
+  LEFT/RIGHT: choose them in Movie > Mothlight > Theme. The hint bar lists only keys that work.
+- DOWN and SET go through ML's long-press check, which redraws the screen: the panel now
+  repaints within a frame after any key.
+- Applying runs in a helper task, so the panel stays on screen while LiveView restarts;
+  INFO / MENU can close it mid-apply.
+- BURST everywhere was the stock SD clock (the camera measured 37.5 MB/s): the panel says so
+  and points to Debug > SD Overclock.
+- the event log keeps listening 3 s after the panel closes; times print (no %u in Canon's printf)
+
 ## 0.1.1 (first camera test, 23 Nov 2026)
 
 Found on the camera:

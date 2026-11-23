@@ -247,7 +247,10 @@ static void canon_redraw_screen(void)
 static void canon_receive(int code)
 {
     canon_got[code & 0xff]++;
-    if (overlay_active && code != 93 && code != 91 && code != 97 && code != 105) canon_key_redraws_open++;
+    /* housekeeping: card door, power checks, "info changed", "press button something" (0x54
+       follows every press on the real camera, and UP stayed smooth there) -- no redraw */
+    if (code == 93 || code == 91 || code == 97 || code == 105 || code == 0x54) return;
+    if (overlay_active) canon_key_redraws_open++;
     if (!cam.lv_on || cam.playback) return;
     switch (code)
     {
@@ -336,16 +339,37 @@ static void press_down_eosm(int hold_ms)
     gui_event_x(K_DOWN_UP, 1);
 }
 
-/* a press and its release, the way the EOS M sends them */
+/* A press and its release, the way the EOS M sends them -- taken from MOTHLOG.TXT written
+   by the real camera:
+     - every button press is followed by Canon's 0x54 ("press button something")
+     - DOWN and SET go through ML's long-press check (redraw, then a fake press + release)
+     - RIGHT never reaches ML in LiveView: Canon acts on it and only "info changed" (0x69)
+       and the release (0x27) arrive */
+static void press_set_eosm(int hold_ms)
+{
+    run_for(hold_ms);
+    gui_event(K_SET_UP);                    /* the real release arrives first ... */
+    gui_event(K_UNHANDLED);
+    canon_redraw_screen(); ml_redraws++;    /* ... ML's long-press check redraws ... */
+    gui_event_x(K_SET, 1);                  /* ... and sends a fake SET */
+    gui_event_x(K_SET_UP, 1);
+}
+
 static void tap(int canon, int hold_ms)
 {
-    if (canon == K_DOWN) { press_down_eosm(hold_ms); return; }
+    if (canon == K_DOWN) { press_down_eosm(hold_ms); gui_event(K_UNHANDLED); return; }
+    if (canon == K_SET && cam.lv_on && !cam.menu_shown) { press_set_eosm(hold_ms); return; }
+    if (canon == K_RIGHT && cam.lv_on && !cam.menu_shown)
+    {
+        gui_event(K_UNHANDLED); gui_event(K_OLC); run_for(hold_ms); gui_event(K_RIGHT_UP);
+        return;
+    }
     gui_event(canon);
+    if (canon == K_UP || canon == K_LEFT) gui_event(K_UNHANDLED);
     run_for(hold_ms);
     switch (canon)
     {
         case K_UP: gui_event(K_UP_UP); break;
-        case K_DOWN: gui_event(K_DOWN_UP); break;
         case K_LEFT: gui_event(K_LEFT_UP); break;
         case K_RIGHT: gui_event(K_RIGHT_UP); break;
         case K_SET: gui_event(K_SET_UP); break;
@@ -700,17 +724,21 @@ static void s_event_log(void)
     boot(); open_panel();
     tap(K_LEFT, 40); tap(K_RIGHT, 40); tap(K_DOWN, 60); tap(K_UP, 40);
     close_panel();
-    run_for(500);
+    tap(K_UP, 40);                          /* after closing: logged as "[panel closed]" */
+    run_for(3500);
+    EXPECT(strstr(logfile, "[panel closed]"), "keys after closing not logged:\n%s", logfile);
     EXPECT(logfile_writes == 1, "log written %d times", logfile_writes);
-    EXPECT(strstr(logfile, "OPEN") && strstr(logfile, "button 0x28") && strstr(logfile, "button 0x26")
+    run_for(3500);                          /* it keeps listening 3 s after closing, then writes */
+    EXPECT(strstr(logfile, "OPEN") && strstr(logfile, "button 0x28") && strstr(logfile, "button 0x69")
            && strstr(logfile, "(fake)") && strstr(logfile, "CLOSE closed by a key"), "log content:\n%s", logfile);
+    EXPECT(!strstr(logfile, "  u  "), "log times did not print");
     /* never written while recording */
     open_panel();
     tap(K_REC, 0);
     run_for(2000);
     EXPECT(logfile_writes_recording == 0, "log written while recording");
     cam.recording = 0;
-    run_for(500);
+    run_for(3500);
     EXPECT(logfile_writes == 2 && strstr(logfile, "CLOSE closed by REC/PLAY/shutter"), "log after REC:\n%s", logfile);
     finish();
 }
@@ -718,12 +746,18 @@ static void s_event_log(void)
 static void s_themes_all(void)
 {
     boot(); open_panel();
-    int t0 = cfg_theme;
-    for (int i = 0; i < THEME_COUNT; i++) { tap(K_RIGHT, 60); run_for(250); }
-    EXPECT(cfg_theme == t0, "RIGHT x%d did not wrap to the same theme", THEME_COUNT);
-    for (int i = 0; i < 3; i++) { tap(K_LEFT, 60); run_for(250); }
-    EXPECT(cfg_theme == (t0 + THEME_COUNT - 3) % THEME_COUNT, "LEFT x3 went to %d", cfg_theme);
-    EXPECT(panel_open_now(), "panel closed while changing themes");
+    int t0 = cfg_theme, s0 = panel.sel;
+    tap(K_LEFT, 40); tap(K_RIGHT, 40); run_for(300);
+    EXPECT(cfg_theme == t0 && panel.sel == s0 && panel_open_now(), "LEFT/RIGHT changed something (theme %d, sel %d)", cfg_theme, panel.sel);
+    close_panel();
+    /* the theme is set in Movie > Mothlight > Theme; every theme opens and draws */
+    for (int t = 0; t < THEME_COUNT; t++)
+    {
+        cfg_theme = t;
+        open_panel();
+        EXPECT(screen_says(moth_themes[t].name), "theme %s not shown after choosing it in the menu", moth_themes[t].name);
+        close_panel();
+    }
     finish();
 }
 
@@ -851,7 +885,7 @@ static void s_apply_with_lv_refresh(void)
     int idx = find_profile(MOOD_1X1);
     select_profile(idx);
     tap(K_SET, 40);
-    run_for(1200);                          /* LiveView restarted meanwhile */
+    run_for(2000);                          /* LiveView restarted meanwhile */
     EXPECT(overlay_active, "the LiveView refresh during apply closed the panel");
     EXPECT(cfg_active == idx, "active profile %d, expected %d", cfg_active, idx);
     EXPECT(menu_val("Movie", "Crop mood") == profiles[idx].mood, "Crop mood not set");
@@ -1071,8 +1105,8 @@ static void s_bad_config_at_boot(void)
     cfg_theme = 99; cfg_active = 40; cfg_card = 77; cfg_tally = 9; cfg_bpp10 = -5;
     boot();
     open_panel();
-    tap(K_RIGHT, 30); run_for(300);
-    EXPECT(cfg_theme >= 0 && cfg_theme < THEME_COUNT, "theme index %d after a corrupt config", cfg_theme);
+    tap(K_DOWN, 30); run_for(300);
+    EXPECT(panel_open_now(), "panel not usable after a corrupt config");
     struct menu_display_info info = { 0 };
     for (struct menu_entry * e = menu_root; e < menu_root + menu_n; e++)
     {
@@ -1197,7 +1231,7 @@ static void s_text_fits(void)
                     check_text_fits("browsing");
                     tap(K_DOWN, 20);
                 }
-                tap(K_RIGHT, 20);
+                close_panel(); cfg_theme = (t + 1) % THEME_COUNT; open_panel();
             }
             /* the applying line and the result with the longest name, as the active profile */
             select_profile(variant ? 1 : 0);

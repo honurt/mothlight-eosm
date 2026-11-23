@@ -482,11 +482,10 @@ static void render_hint(struct panel * p, const struct panel_view * v, struct ca
     uint8_t fg = bar_text(v);
     x += keycap(v, c, x, y, "SET", -1) + 6;   x += ui_text(c, UF_SMALL, x, y + 5, fg, UA_LEFT, "Apply") + 22;
     x += keycap(v, c, x, y, "", 10) + 6;      x += ui_text(c, UF_SMALL, x, y + 5, fg, UA_LEFT, "Choose") + 22;
-    x += keycap(v, c, x, y, "", 11) + 6;      x += ui_text(c, UF_SMALL, x, y + 5, fg, UA_LEFT, "Theme") + 22;
     x += keycap(v, c, x, y, "INFO", -1) + 6;  ui_text(c, UF_SMALL, x, y + 5, fg, UA_LEFT, "Close");
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "%s theme", TH->name);
+    snprintf(buf, sizeof(buf), "%s theme (ML menu)", TH->name);
     ui_text(c, UF_SMALL, SW - 16, y + 5, bar_dim(v), UA_RIGHT, buf);
 }
 

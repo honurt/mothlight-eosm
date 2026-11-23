@@ -27,8 +27,10 @@ int main(void)
     const int dpad[] = { MODULE_KEY_PRESS_DOWN, 0, MODULE_KEY_PRESS_DOWN, 0,
                          MODULE_KEY_PRESS_RIGHT, 0, MODULE_KEY_PRESS_SET, MODULE_KEY_UNPRESS_SET };
     CHECK(run(dpad, 8, nav, &nn) == 0, "D-pad press/release must not close the panel");
-    CHECK(nn == 4 && nav[0] == PK_DOWN && nav[1] == PK_DOWN && nav[2] == PK_RIGHT && nav[3] == PK_SET,
-          "D-pad stream must navigate DOWN DOWN RIGHT SET");
+    CHECK(nn == 3 && nav[0] == PK_DOWN && nav[1] == PK_DOWN && nav[2] == PK_SET,
+          "D-pad stream must navigate DOWN DOWN SET (RIGHT does nothing: Canon owns it on the EOS M)");
+    CHECK(moth_route_key(MODULE_KEY_PRESS_LEFT).pass_to_canon == 0 && moth_route_key(MODULE_KEY_PRESS_LEFT).panel_key == PK_NONE,
+          "LEFT is kept from Canon and does nothing");
 
     const int wheel[] = { MODULE_KEY_WHEEL_RIGHT, MODULE_KEY_WHEEL_RIGHT, MODULE_KEY_WHEEL_LEFT };
     CHECK(run(wheel, 3, nav, &nn) == 0 && nn == 3 && nav[2] == PK_UP, "rear wheel scrolls");

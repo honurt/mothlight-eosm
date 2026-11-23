@@ -119,6 +119,9 @@ struct log_ev { uint32_t t; short code; char kind; signed char a, b; };
 static struct log_ev log_ring[LOG_N];
 static volatile unsigned log_n;
 static volatile int log_dirty;
+static volatile uint32_t closed_at;          /* keep logging buttons for 3 s after the panel closes */
+#define LOG_AFTER_CLOSE_MS 3000
+static int logging(void) { return overlay_active || get_ms_clock() - closed_at < LOG_AFTER_CLOSE_MS; }
 
 static void mlog(char kind, int code, int a, int b)
 {
@@ -136,17 +139,17 @@ static int log_line(char * out, int len, const struct log_ev * e)
     const char * k = (e->a >= 0 && e->a <= 6) ? pk[(int)e->a] : (e->a == PK_CLOSE_NOW ? "close-now" : "?");
     switch (e->kind)
     {
-        case 'K': return snprintf(out, len, "%7u  button 0x%02x%s  -> %s\n", (unsigned)e->t, e->code & 0xffff,
-                                  e->b ? " (fake)" : "", "seen first by Mothlight");
-        case 'P': return snprintf(out, len, "%7u  portable key %d  -> panel %s, %s\n", (unsigned)e->t, e->code, k,
+        case 'K': return snprintf(out, len, "%7d  button 0x%02x%s%s\n", (int)e->t, e->code & 0xffff,
+                                  e->b ? " (fake)" : "", e->a ? "" : "   [panel closed]");
+        case 'P': return snprintf(out, len, "%7d  portable key %d  -> panel %s, %s\n", (int)e->t, e->code, k,
                                   e->b ? "passed on to Canon" : "kept");
-        case 'O': return snprintf(out, len, "%7u  OPEN  theme %d, %d profiles\n", (unsigned)e->t, e->code, e->a);
-        case 'C': return snprintf(out, len, "%7u  CLOSE %s\n", (unsigned)e->t,
+        case 'O': return snprintf(out, len, "%7d  OPEN  theme %d, %d profiles\n", (int)e->t, e->code, e->a);
+        case 'C': return snprintf(out, len, "%7d  CLOSE %s\n", (int)e->t,
                                   e->code >= 0 && e->code < (int)COUNT(close_why) ? close_why[e->code] : "?");
-        case 'R': return snprintf(out, len, "%7u  repaint (something drew over the panel)\n", (unsigned)e->t);
-        case 'T': return snprintf(out, len, "%7u  theme -> %d\n", (unsigned)e->t, e->code);
-        case 'A': return snprintf(out, len, "%7u  apply step %d (%d)\n", (unsigned)e->t, e->code, e->a);
-        case 'L': return snprintf(out, len, "%7u  LiveView %s\n", (unsigned)e->t, e->code ? "back" : "gone");
+        case 'R': return snprintf(out, len, "%7d  repaint (something drew over the panel)\n", (int)e->t);
+        case 'T': return snprintf(out, len, "%7d  theme -> %d\n", (int)e->t, e->code);
+        case 'A': return snprintf(out, len, "%7d  apply step %d (%d)\n", (int)e->t, e->code, e->a);
+        case 'L': return snprintf(out, len, "%7d  LiveView %s\n", (int)e->t, e->code ? "back" : "gone");
     }
     return 0;
 }
@@ -463,6 +466,7 @@ static void overlay_end(int why)
 {
     mlog('C', why, 0, 0);
     log_dirty = 1;
+    closed_at = get_ms_clock();
     overlay_active = 0;
     panel.state = PS_CLOSED;
     apply_phase = 0;                        /* an apply cut short is not resumed on the next open */
@@ -672,7 +676,7 @@ static void moth_task(void)
             continue;
         }
 
-        if (log_dirty && !RECORDING && apply_helper != 1) log_flush();
+        if (log_dirty && !RECORDING && apply_helper != 1 && !logging()) log_flush();
 
         watch_recording(now);
         tally(now);
@@ -734,9 +738,9 @@ static unsigned int moth_keypress_cbr(unsigned int key)
 
 static unsigned int moth_keypress_raw_cbr(unsigned int raw)
 {
-    if (!overlay_active || keys_released) return 1;
     const struct event * e = (const struct event *) raw;
-    if (e && e->type == 0 && e->param >= 0) mlog('K', e->param, 0, IS_FAKE(e) ? 1 : 0);
+    if (e && e->type == 0 && e->param >= 0 && logging()) mlog('K', e->param, overlay_active, IS_FAKE(e) ? 1 : 0);
+    if (!overlay_active || keys_released) return 1;
     if (e && e->type == 0)
         switch (e->param)
         {
@@ -800,7 +804,7 @@ static struct menu_entry moth_menu[] =
                 .name = "Theme", .priv = &cfg_theme, .max = THEME_COUNT - 1,
                 .choices = CHOICES("Mothlight", "Stock", "Studio", "Amber", "Signal", "Material",
                                    "Soft", "Glass", "Daylight", "Night", "Mono"),
-                .help = "How the panel looks. In the panel, LEFT / RIGHT switch it live.",
+                .help = "How the panel looks. Takes effect the next time the panel opens.",
             },
             {
                 .name = "Panel key", .priv = &cfg_key, .max = 1,
