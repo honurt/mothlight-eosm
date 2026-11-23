@@ -38,6 +38,7 @@
 #include "version.h"
 #include "panel.h"
 #include "qbar.h"
+#include "settings.h"
 #include "keymap.h"
 #include "repair.h"
 #include "ui_text.h"
@@ -61,6 +62,7 @@ static CONFIG_INT("moth.bpp10",   cfg_bpp10,   0);
 static CONFIG_INT("moth.bpp11",   cfg_bpp11,   0);
 static CONFIG_INT("moth.bpp12",   cfg_bpp12,   0);
 static CONFIG_INT("moth.bpp14",   cfg_bpp14,   0);
+static CONFIG_INT("moth.welcomed", cfg_welcomed, 0); /* the first-start welcome was shown */
 
 static const int card_mb[] = { 0, 30, 40, 50, 60, 65, 70, 75, 80, 90 };
 
@@ -75,11 +77,24 @@ static struct panel panel;
 static struct panel_view view;
 
 /* the overlay shows one of two things */
-enum { OV_PANEL = 1, OV_BAR = 2 };
+enum { OV_PANEL = 1, OV_BAR = 2, OV_SETTINGS = 3 };
 static int ov_mode;
 static struct qbar qbar;
 static struct qbar_view qview;
 static uint32_t qview_read_at;
+static struct settings sets;
+static struct settings_view sview;
+static int settings_from_bar;
+static int welcome_mode;                    /* the settings page shows the welcome / setup check */
+static int welcome_from_settings;           /* ... opened from Settings: back goes to Settings */
+static int welcome_tried;                   /* the automatic first-start welcome was opened this boot */               /* the settings page was opened from the quick bar */
+static int bar_hint_seen;                   /* after the first time, the bar's strip shows warnings */
+
+/* focus punch-in: x10 from the bar, back to where we were afterwards */
+static volatile int zoom_job;               /* a zoom change is running in its helper task */
+static int zoom_before;                     /* lv_dispsize before the punch-in; 0 = not zoomed by us */
+static int zoom_restore;                    /* the overlay closed while punched in: zoom back when idle */
+static volatile uint32_t rec_after_zoom;    /* REC pressed while punched in (time): record once zoomed back */
 static int panel_from_bar;                  /* the profile list was opened from the quick bar: go back to it */
 static volatile int tap_pending, tap_x, tap_y;   /* a tap on the quick bar (touch position read from RAM) */
 
@@ -179,7 +194,7 @@ static int log_line(char * out, int len, const struct log_ev * e)
         case 'P': return snprintf(out, len, "%7d  portable key %d  -> panel %s, %s\n", (int)e->t, e->code, k,
                                   e->b ? "passed on to Canon" : "kept");
         case 'O': return snprintf(out, len, "%7d  OPEN  %s, theme %d, %d profiles\n", (int)e->t,
-                                  e->b == OV_BAR ? "quick bar" : "profiles", e->code, e->a);
+                                  e->b == OV_BAR ? "quick bar" : e->b == OV_SETTINGS ? "settings" : "profiles", e->code, e->a);
         case 'C': return snprintf(out, len, "%7d  CLOSE %s\n", (int)e->t,
                                   e->code >= 0 && e->code < (int)COUNT(close_why) ? close_why[e->code] : "?");
         case 'R': return snprintf(out, len, "%7d  repaint (something drew over the panel)\n", (int)e->t);
@@ -190,6 +205,7 @@ static int log_line(char * out, int len, const struct log_ev * e)
                                   (int)e->v, (int)(e->v & 0xffff), (int)(e->v >> 16), e->a ? "  (used)" : "");
         case 'Y': return snprintf(out, len, "%7d  touch 0x%02x  obj 0x%08x arg 0x%x\n", (int)e->t, e->code & 0xffff,
                                   (int)e->v, e->a);
+        case 'S': return snprintf(out, len, "%7d  settings: item %d%s\n", (int)e->t, e->code, e->a ? " (failed)" : "");
         case 'E': return snprintf(out, len, "%7d  quick bar: setting %d %s, %s\n", (int)e->t, e->code,
                                   e->a > 0 ? "up" : "down", e->b ? "changed" : "unchanged");
     }
@@ -464,6 +480,10 @@ static const char * wb_name(int mode)
 }
 
 /* what each setting shows; read from ML's lens_info (Canon's own properties) */
+struct warning { char text[72]; int bad; };
+static int collect_warnings(struct warning * w, int max);
+static void start_zoom(int z);
+
 static void qb_fill(struct qbar_view * q)
 {
     memset(q->item, 0, sizeof(q->item));
@@ -483,7 +503,7 @@ static void qb_fill(struct qbar_view * q)
     else
     {
         copy_str(it->value, sizeof(it->value), "Auto");
-        copy_str(it->sub, sizeof(it->sub), "auto (Canon)");
+        copy_str(it->sub, sizeof(it->sub), "by Canon");
         it->locked = 1;
     }
 
@@ -497,7 +517,7 @@ static void qb_fill(struct qbar_view * q)
     else if (!lens_info.raw_aperture)
     {
         copy_str(it->value, sizeof(it->value), "Auto");
-        copy_str(it->sub, sizeof(it->sub), "auto (Canon)");
+        copy_str(it->sub, sizeof(it->sub), "by Canon");
         it->locked = 1;
     }
     else
@@ -506,7 +526,7 @@ static void qb_fill(struct qbar_view * q)
         copy_str(it->value, sizeof(it->value), lens_format_aperture(lens_info.raw_aperture));
         copy_str(lo, sizeof(lo), lens_format_aperture(lens_info.raw_aperture_min));
         copy_str(hi, sizeof(hi), lens_format_aperture(lens_info.raw_aperture_max));
-        snprintf(it->sub, sizeof(it->sub), "%s - %s", lo, hi[0] == 'f' && hi[1] == '/' ? hi + 2 : hi);
+        snprintf(it->sub, sizeof(it->sub), "%s-%s", lo, hi[0] == 'f' && hi[1] == '/' ? hi + 2 : hi);
     }
 
     it = &q->item[QB_ISO];
@@ -534,6 +554,22 @@ static void qb_fill(struct qbar_view * q)
         copy_str(it->sub, sizeof(it->sub), "dial: Kelvin");
         it->sub_tone = QT_ACCENT;
     }
+
+    it = &q->item[QB_FOCUS];
+    snprintf(it->value, sizeof(it->value), "x%d", lv_dispsize > 0 ? lv_dispsize : 1);
+    if (lv_dispsize == 10) { copy_str(it->sub, sizeof(it->sub), "DOWN back"); it->sub_tone = QT_ACCENT; }
+    else                   { copy_str(it->sub, sizeof(it->sub), "UP x10"); }
+    if (zoom_job) { copy_str(it->sub, sizeof(it->sub), "..."); }
+
+    it = &q->item[QB_MENU];
+    copy_str(it->value, sizeof(it->value), "Settings");
+    {
+        struct warning w[8];
+        int nw = collect_warnings(w, 8);
+        if (nw) { snprintf(it->sub, sizeof(it->sub), "%d warning%s", nw, nw > 1 ? "s" : ""); it->sub_tone = QT_BURST; }
+        else    { copy_str(it->sub, sizeof(it->sub), "all good"); it->sub_tone = QT_OK; }
+    }
+    q->battery_bars = battery_level_bars;
 
     it = &q->item[QB_PROFILE];
     if (cfg_active >= 0 && cfg_active < profile_count)
@@ -573,6 +609,22 @@ static void qb_adjust(int item, int sign, uint32_t now)
         case QB_SHUTTER:  before = lens_info.raw_shutter;  shutter_toggle((void *)-1, sign);  after = lens_info.raw_shutter;  break;
         case QB_APERTURE: before = lens_info.raw_aperture; aperture_toggle((void *)-1, sign); after = lens_info.raw_aperture; break;
         case QB_ISO:      before = lens_info.raw_iso;      iso_toggle((void *)-1, sign);      after = lens_info.raw_iso;      break;
+        case QB_FOCUS:
+            if (zoom_job) return;
+            if (sign > 0 && lv_dispsize != 10)
+            {
+                zoom_before = lv_dispsize > 0 ? lv_dispsize : 1;
+                start_zoom(10);
+                qbar_toast(&qbar, "x10: focus by hand, or half-press for autofocus", 0, now);
+            }
+            else if (sign < 0 && lv_dispsize == 10)
+            {
+                start_zoom(zoom_before ? zoom_before : 5);
+                zoom_before = 0;
+            }
+            else qbar_toast(&qbar, lv_dispsize == 10 ? "Already at x10" : "Not zoomed in", 0, now);
+            mlog('E', item, sign, 1);
+            return;
         case QB_WB:
             before = lens_info.wb_mode == WB_KELVIN ? (int)lens_info.kelvin : -1;
             kelvin_toggle((void *)-1, sign);
@@ -590,6 +642,360 @@ static const char * qb_locked_reason(int item)
 {
     if (item == QB_APERTURE && !lens_info.lens_exists) return "Manual lens: set the aperture on the lens";
     return "Automatic: in Canon's menu set Movie exposure to Manual";
+}
+
+/* ---------------------------------------------------------------- smart warnings */
+
+static void load_profiles(void);
+static void learned_reset_now(void);
+
+
+/* what could spoil a take, most serious first */
+static int collect_warnings(struct warning * w, int max)
+{
+    int n = 0;
+#define WARN(bad_, ...) do { if (n < max) { snprintf(w[n].text, sizeof(w[n].text), __VA_ARGS__); w[n].bad = bad_; n++; } } while (0)
+    int is_auto;
+    int card = card_kBps(&is_auto);
+    int sd = menu_get_value_from_script("Debug", "SD Overclock");
+    int sound = menu_get_value_from_script("RAW video", "Sound recording");
+    int raw_on = menu_get_value_from_script("Movie", "RAW video");
+    const struct rec_profile * p = (cfg_active >= 0 && cfg_active < profile_count) ? &profiles[cfg_active] : 0;
+    int raw_profile = p && p->mood != MOOD_OFF;
+    enum budget_verdict vd = BUDGET_CONTINUOUS;
+    int mins = -1;
+    if (raw_profile)
+    {
+        int need = budget_kBps(live_fmt.width > 0 ? &live_fmt : &p->nominal, &bpp);
+        vd = budget_verdict(need, card);
+        mins = budget_minutes_on_card(need, free_MB());
+    }
+
+    if (battery_level_bars == 0)          WARN(1, "Battery low");
+    if (raw_profile && raw_on == 0)       WARN(1, "RAW video is off: apply the profile again");
+    if (!lens_info.raw_shutter)           WARN(1, "Movie exposure is Auto: set Manual in Canon's menu");
+    if (raw_profile && mins >= 0 && mins < 3) WARN(1, "Card almost full: ~%d min left", mins);
+    if (raw_profile && is_auto && sd == 0 && vd != BUDGET_CONTINUOUS)
+                                          WARN(0, "SD Overclock is off: the card runs at ~%d MB/s", card / 1000);
+    if (raw_profile && sound > 0 && (sd == 3 || vd != BUDGET_CONTINUOUS))
+                                          WARN(0, "Sound recording is on: it can stop RAW at this rate");
+    if (raw_profile && vd == BUDGET_BURST) WARN(0, "%s records in short bursts on this card", p->name);
+#undef WARN
+    return n;
+}
+
+/* ---------------------------------------------------------------- focus punch-in */
+
+static void zoom_task(void * arg)
+{
+    int z = (int)(intptr_t)arg;
+    if (z == 5) { set_lv_zoom(1); set_lv_zoom(5); }  /* via x1, as Crop Mood does (x10 -> x5 can go black) */
+    else set_lv_zoom(z);
+    zoom_job = 0;
+}
+
+static void start_zoom(int z)
+{
+    if (zoom_job) return;
+    zoom_job = 1;
+    task_create("moth_zoom", 0x1e, 0x1000, (void *) zoom_task, (void *)(intptr_t)z);
+}
+
+/* once idle: back to the zoom from before the punch-in (also if the x10 is still being set) */
+static void zoom_restore_step(void)
+{
+    if (!zoom_restore || zoom_job) return;
+    if (lv_dispsize == 10 && lv) start_zoom(zoom_before ? zoom_before : 5);
+    zoom_before = 0;
+    zoom_restore = 0;
+}
+
+/* ---------------------------------------------------------------- saving the current setup */
+
+static int menu_int(const char * menu, const char * entry, int lo, int hi)
+{
+    int v = menu_get_value_from_script(menu, entry);
+    return (v == INT_MIN || v < lo || v > hi) ? -1 : v;
+}
+
+static void save_current_profile(char * msg, int len, int * bad)
+{
+    *bad = 1;
+    int mood = menu_int("Movie", "Crop mood", 0, 3);
+    if (mood < 0) { snprintf(msg, len, "Load crop_rec in the Modules tab"); return; }
+    struct rec_profile p;
+    memset(&p, 0, sizeof(p));
+    p.mood = mood;
+    if (mood == MOOD_OFF) { p.bits = -1; }
+    else
+    {
+        static const char * preset_entry[] = { "", "Preset:", "Preset: ", "Preset:  " };
+        static const int preset_max[] = { 0, 5, 2, 1 };
+        p.preset = menu_int("Crop mood", preset_entry[mood], 0, preset_max[mood]);
+        p.ratio  = menu_int("Crop mood", "Aspect ratio:", 0, 4);
+        p.fps    = menu_int("Crop mood", "Framerate:", 0, 2);
+        p.bits   = menu_int("Crop mood", "Bit-depth", 0, 3);
+        if (p.preset < 0 || p.ratio < 0 || p.fps < 0 || p.bits < 0)
+        {
+            snprintf(msg, len, "Could not read Crop Mood's settings");
+            return;
+        }
+    }
+    profile_fill_nominal(&p);
+    for (int i = 0; i < profile_count; i++)
+        if (profile_same_setup(&profiles[i], &p))
+        {
+            cfg_active = i;
+            *bad = 0;
+            snprintf(msg, len, "Already saved as \"%s\"", profiles[i].name);
+            return;
+        }
+    if (profile_count >= MAX_PROFILES) { snprintf(msg, len, "%d profiles is the most: edit PROFILES.TXT", MAX_PROFILES); return; }
+    profile_auto_name(&p, p.name, sizeof(p.name));
+
+    /* the whole list goes to PROFILES.TXT (it replaces the built-in list once it exists) */
+    int cap = (profile_count + 1) * 96 + 200;
+    char * text = malloc(cap);
+    if (!text) { snprintf(msg, len, "Out of memory"); return; }
+    int n = snprintf(text, cap, "# Mothlight recording profiles: name | mode | preset | ratio | fps | bits\n"
+                                "# Saved from the camera. See docs/PROFILES.md.\n");
+    for (int i = 0; i < profile_count && n < cap - 96; i++) n += profile_format_line(&profiles[i], text + n, cap - n);
+    n += profile_format_line(&p, text + n, cap - n);
+    char path[64];
+    snprintf(path, sizeof(path), "%sPROFILES.TXT", get_config_dir());
+    FILE * f = FIO_CreateFile(path);
+    if (f) { FIO_WriteFile(f, text, n); FIO_CloseFile(f); }
+    free(text);
+    if (!f) { snprintf(msg, len, "Could not write PROFILES.TXT"); return; }
+
+    load_profiles();
+    for (int i = 0; i < profile_count; i++)
+        if (profile_same_setup(&profiles[i], &p)) { cfg_active = i; break; }
+    *bad = 0;
+    snprintf(msg, len, "Saved as \"%s\"", p.name);
+}
+
+/* ---------------------------------------------------------------- the settings page */
+
+enum { SI_THEME = 1, SI_MOTION, SI_INFO, SI_TALLY, SI_SDCLOCK, SI_CARD, SI_SOUND, SI_HACKS,
+       SI_OVERLAYS, SI_ZEBRAS, SI_PEAK, SI_FALSECOLOR, SI_SAVE, SI_LEARNED, SI_WELCOME,
+       SI_WELCOME_DONE, SI_CHECK_CROP, SI_CHECK_RAW, SI_CHECK_SD, SI_CHECK_EXPO, SI_CHECK_SOUND };
+
+static const char * theme_names[] = { "Mothlight", "Stock", "Studio", "Amber", "Signal", "Material",
+                                      "Soft", "Glass", "Daylight", "Night", "Mono" };
+
+static void add_row(struct settings_view * v, int kind, int id, int tone, const char * label, const char * value, const char * help)
+{
+    if (v->count >= SET_MAX_ROWS) return;
+    struct set_row * r = &v->row[v->count++];
+    r->kind = kind; r->id = id; r->tone = tone; r->help = help;
+    snprintf(r->label, sizeof(r->label), "%s", label);
+    snprintf(r->value, sizeof(r->value), "%s", value ? value : "");
+}
+
+/* an ML menu value as a word, or "module not loaded" */
+static void ml_value(char * buf, int len, const char * menu, const char * entry, const char * const * words, int n, int * tone)
+{
+    int v = menu_get_value_from_script(menu, entry);
+    if (v == INT_MIN) { snprintf(buf, len, "not loaded"); *tone = ST_DIM; return; }
+    snprintf(buf, len, "%s", (v >= 0 && v < n) ? words[v] : "?");
+    *tone = ST_NORMAL;
+}
+
+/* the first start: what Mothlight is, how to drive it, and whether the camera is set up for it */
+static void build_welcome(struct settings_view * v)
+{
+    char val[28];
+    memset(v, 0, sizeof(*v));
+    v->theme = theme();
+    v->reduced_motion = !cfg_motion;
+    v->battery_bars = battery_level_bars;
+    snprintf(v->title, sizeof(v->title), "Welcome");
+    {
+        char line[48];
+        snprintf(line, sizeof(line), "%s %s is installed and running.", MOTH_UI_NAME, MOTH_UI_VERSION);
+        add_row(v, SR_NOTE, 0, 0, line, 0, 0);
+    }
+    add_row(v, SR_ITEM, SI_WELCOME_DONE, ST_ACCENT, "Start shooting", "OK",
+            "Closes this page. It comes back from Settings > About > Welcome and setup check.");
+
+    add_row(v, SR_SECTION, 0, 0, "HOW IT WORKS", 0, 0);
+    add_row(v, SR_NOTE, 0, 0, "INFO opens the quick bar at the bottom of the screen", 0, 0);
+    add_row(v, SR_NOTE, 0, 0, "SET moves between tiles, UP / DOWN changes the value", 0, 0);
+    add_row(v, SR_NOTE, 0, 0, "PROFILE: recording presets.  FOCUS: x10 punch-in", 0, 0);
+    add_row(v, SR_NOTE, 0, 0, "MENU: these settings.  Two-finger tap: ML's own menu", 0, 0);
+
+    add_row(v, SR_SECTION, 0, 0, "SETUP CHECK", 0, 0);
+    int crop = menu_get_value_from_script("Movie", "Crop mood") != INT_MIN;
+    add_row(v, SR_ITEM, SI_CHECK_CROP, crop ? ST_OK : ST_BAD, "Crop Mood (crop_rec)", crop ? "Ready" : "Not loaded",
+            crop ? "The sensor modes behind the 2.5K, 2.8K and 3K profiles."
+                 : "Magic Lantern menu > Modules: load crop_rec, then restart the camera.");
+    int raw = menu_get_value_from_script("Movie", "RAW video") != INT_MIN;
+    add_row(v, SR_ITEM, SI_CHECK_RAW, raw ? ST_OK : ST_BAD, "RAW recording (mlv_lite)", raw ? "Ready" : "Not loaded",
+            raw ? "Records the RAW video when you press REC."
+                : "Magic Lantern menu > Modules: load mlv_lite, then restart the camera.");
+    int sd = menu_get_value_from_script("Debug", "SD Overclock");
+    static const char * sdw[] = { "Off", "160 MHz", "192 MHz", "240 MHz" };
+    if (sd == INT_MIN) snprintf(val, sizeof(val), "Not loaded");
+    else snprintf(val, sizeof(val), "%s", (sd >= 0 && sd < 4) ? sdw[sd] : "?");
+    add_row(v, SR_ITEM, SI_CHECK_SD, sd == INT_MIN ? ST_DIM : sd == 0 ? ST_EDGE : ST_OK, "SD card speed (sd_uhs)", val,
+            sd == INT_MIN ? "Optional: load sd_uhs in Modules for ~65 MB/s instead of ~38 (more profiles record without stopping)."
+                          : "SET here steps through the speeds. 160 MHz suits most cards; restart the camera to use it.");
+    int manual = lens_info.raw_shutter != 0;
+    add_row(v, SR_ITEM, SI_CHECK_EXPO, manual ? ST_OK : ST_EDGE, "Movie exposure", manual ? "Manual" : "Auto",
+            manual ? "Shutter, aperture and ISO are yours to set on the quick bar."
+                   : "Canon menu > Movie exposure: Manual. Otherwise the camera picks shutter and ISO itself.");
+    int snd = menu_get_value_from_script("RAW video", "Sound recording");
+    add_row(v, SR_ITEM, SI_CHECK_SOUND, snd == INT_MIN ? ST_DIM : ST_OK, "Sound with RAW (mlv_snd)",
+            snd == INT_MIN ? "Not loaded" : snd ? "On" : "Off",
+            "Optional: load mlv_snd in Modules to record a WAV next to each clip.");
+}
+
+static void build_settings(struct settings_view * v)
+{
+    if (welcome_mode) { build_welcome(v); return; }
+    static const char * offon[] = { "Off", "On" };
+    static const char * motion[] = { "Off", "Smooth" };
+    static const char * info[] = { "Nothing", "Quick bar", "Profiles" };
+    static const char * tally[] = { "Off", "Red frame", "Pulsing" };
+    static const char * sd[] = { "Off", "160 MHz", "192 MHz", "240 MHz" };
+    static const char * hacks[] = { "Off", "On", "More", "All" };
+    char val[28];
+    int tone;
+
+    memset(v, 0, sizeof(*v));
+    v->theme = theme();
+    v->reduced_motion = !cfg_motion;
+    v->battery_bars = battery_level_bars;
+
+    struct warning w[8];
+    int nw = collect_warnings(w, 8);
+    v->warn_count = nw;
+    for (int i = 0; i < nw; i++) add_row(v, SR_WARN, 0, w[i].bad ? ST_BAD : ST_EDGE, w[i].text, 0, 0);
+
+    add_row(v, SR_SECTION, 0, 0, "LOOK", 0, 0);
+    add_row(v, SR_ITEM, SI_THEME, 0, "Theme", theme_names[(cfg_theme >= 0 && cfg_theme < THEME_COUNT) ? cfg_theme : 0],
+            "How Mothlight looks. SET tries the next one right here.");
+    add_row(v, SR_ITEM, SI_MOTION, 0, "Animations", motion[cfg_motion ? 1 : 0],
+            "Slides and fades in Mothlight's screens. They never run while recording.");
+    add_row(v, SR_ITEM, SI_INFO, 0, "INFO button opens", info[(cfg_key >= 0 && cfg_key < 3) ? cfg_key : 1],
+            "What INFO shows in LiveView. 'Nothing' gives the button back to Canon.");
+    add_row(v, SR_ITEM, SI_TALLY, 0, "Recording frame", tally[(cfg_tally >= 0 && cfg_tally < 3) ? cfg_tally : 1],
+            "A red frame round the screen while recording, so you never wonder.");
+
+    add_row(v, SR_SECTION, 0, 0, "RECORDING", 0, 0);
+    ml_value(val, sizeof(val), "Debug", "SD Overclock", sd, 4, &tone);
+    add_row(v, SR_ITEM, SI_SDCLOCK, tone, "SD card speed (overclock)", val,
+            "Lets the card write faster: ~38 MB/s at Off, ~65 at 160 MHz. 160 MHz suits most cards. Takes effect after restarting the camera.");
+    {
+        int is_auto, k = card_kBps(&is_auto);
+        if (is_auto) snprintf(val, sizeof(val), "Auto (~%d MB/s)", k / 1000);
+        else         snprintf(val, sizeof(val), "%d MB/s", k / 1000);
+    }
+    add_row(v, SR_ITEM, SI_CARD, 0, "Card speed for OK / BURST", val,
+            "What the verdicts assume. Auto follows the SD clock; measure yours in Debug > Benchmarks and set it here.");
+    ml_value(val, sizeof(val), "RAW video", "Sound recording", offon, 2, &tone);
+    add_row(v, SR_ITEM, SI_SOUND, tone, "Sound with RAW video", val,
+            "Records a WAV next to the MLV. Turn it off at 240 MHz or for heavy profiles: it can stop RAW recording.");
+    ml_value(val, sizeof(val), "RAW video", "Small hacks", hacks, 4, &tone);
+    add_row(v, SR_ITEM, SI_HACKS, tone, "Small hacks", val,
+            "Pauses some of Canon's background work while recording, leaving more speed for the card.");
+
+    add_row(v, SR_SECTION, 0, 0, "FOCUS AND EXPOSURE AIDS", 0, 0);
+    add_row(v, SR_ITEM, SI_OVERLAYS, saved_global_draw < 0 ? ST_DIM : 0, "ML overlays",
+            saved_global_draw < 0 ? "?" : saved_global_draw > 0 ? "On" : "Off",
+            "Magic Lantern's drawings over LiveView. The aids below need it on. Hidden while Mothlight is open.");
+    ml_value(val, sizeof(val), "Overlay", "Zebras", offon, 2, &tone);
+    add_row(v, SR_ITEM, SI_ZEBRAS, tone, "Zebras", val, "Stripes over clipped highlights: lower ISO or close the aperture until they go.");
+    ml_value(val, sizeof(val), "Overlay", "Focus Peak", offon, 2, &tone);
+    add_row(v, SR_ITEM, SI_PEAK, tone, "Focus peaking", val, "Outlines what is in focus. Or punch in: FOCUS on the quick bar.");
+    ml_value(val, sizeof(val), "Overlay", "False color", offon, 2, &tone);
+    add_row(v, SR_ITEM, SI_FALSECOLOR, tone, "False color", val, "Paints exposure levels in colours, like a cinema monitor.");
+
+    add_row(v, SR_SECTION, 0, 0, "PROFILES", 0, 0);
+    add_row(v, SR_ITEM, SI_SAVE, ST_ACCENT, "Save Crop Mood's settings as a profile", "Save",
+            "Adds what Crop Mood is set to now to your profile list (PROFILES.TXT), with a name like 'My 2.5K 2.35 10-bit'.");
+    add_row(v, SR_ITEM, SI_LEARNED, cfg_learned ? ST_OK : ST_DIM, "Compression estimate",
+            cfg_learned ? "Learned" : "Typical",
+            "Mothlight learns how well your clips compress after each take. SET forgets it and starts over.");
+
+    add_row(v, SR_SECTION, 0, 0, "ABOUT", 0, 0);
+    {
+        char about[48];
+        snprintf(about, sizeof(about), "%s %s, %s engine, by Onur", MOTH_UI_NAME, MOTH_UI_VERSION,
+                 MOTH_UI_ENGINE[0] == 'c' ? "Crop Mood" : "ML dev");
+        add_row(v, SR_NOTE, 0, 0, about, 0, 0);
+    }
+    add_row(v, SR_ITEM, SI_WELCOME, 0, "Welcome and setup check", "Show",
+            "The first-start page again: how Mothlight works and whether the camera is set up for it.");
+    add_row(v, SR_NOTE, 0, 0, "Everything else: Magic Lantern's menu, two-finger tap", 0, 0);
+}
+
+/* refresh the rows; if they moved (a warning came or went), keep the selected item */
+static void settings_refresh(const struct settings_view * fresh, uint32_t now)
+{
+    int prev_id = (sets.sel >= 0 && sets.sel < sview.count) ? sview.row[sets.sel].id : -1;
+    int moved = fresh->count != sview.count || fresh->warn_count != sview.warn_count ||
+                fresh->theme != sview.theme;
+    sview = *fresh;
+    if (moved) settings_rebuilt(&sets, &sview, prev_id, now);
+    else settings_changed(&sets);
+}
+
+static void settings_activate(int id, uint32_t now)
+{
+    char msg[72] = "";
+    int bad = 0, v;
+#define CYCLE(menu, entry, n, missing) \
+    do { v = menu_get_value_from_script(menu, entry); \
+         if (v == INT_MIN) { snprintf(msg, sizeof(msg), missing); bad = 1; } \
+         else menu_set_value_from_script(menu, entry, (v + 1) % (n)); } while (0)
+    switch (id)
+    {
+        case SI_THEME:   cfg_theme = (cfg_theme + 1) % THEME_COUNT; break;
+        case SI_MOTION:  cfg_motion = !cfg_motion; break;
+        case SI_INFO:    cfg_key = (cfg_key + 1) % 3; break;
+        case SI_TALLY:   cfg_tally = (cfg_tally + 1) % 3; break;
+        case SI_SDCLOCK:
+            CYCLE("Debug", "SD Overclock", 4, "Load sd_uhs in Magic Lantern's Modules tab");
+            if (!bad) snprintf(msg, sizeof(msg), "Restart the camera to use the new SD speed");
+            break;
+        case SI_CARD:    cfg_card = (cfg_card + 1) % (int)COUNT(card_mb); break;
+        case SI_SOUND:   CYCLE("RAW video", "Sound recording", 2, "Load mlv_snd in Magic Lantern's Modules tab"); break;
+        case SI_HACKS:   CYCLE("RAW video", "Small hacks", 3, "Small hacks need mlv_lite"); break;
+        case SI_OVERLAYS:
+            /* Global Draw is off while Mothlight is open; this sets what comes back */
+            if (saved_global_draw < 0) { snprintf(msg, sizeof(msg), "ML overlays are not available"); bad = 1; }
+            else saved_global_draw = saved_global_draw > 0 ? 0 : 1;
+            break;
+        case SI_ZEBRAS:      CYCLE("Overlay", "Zebras", 2, "Zebras are not available"); break;
+        case SI_PEAK:        CYCLE("Overlay", "Focus Peak", 2, "Focus peaking is not available"); break;
+        case SI_FALSECOLOR:  CYCLE("Overlay", "False color", 2, "False color is not available"); break;
+        case SI_SAVE:        save_current_profile(msg, sizeof(msg), &bad); break;
+        case SI_LEARNED:     learned_reset_now(); snprintf(msg, sizeof(msg), "Compression estimate reset to typical"); break;
+        case SI_WELCOME:     welcome_mode = 1; welcome_from_settings = 1; break;
+        case SI_CHECK_SD:
+            CYCLE("Debug", "SD Overclock", 4, "Load sd_uhs in Magic Lantern's Modules tab");
+            if (!bad) snprintf(msg, sizeof(msg), "Restart the camera to use the new SD speed");
+            break;
+        case SI_CHECK_SOUND: CYCLE("RAW video", "Sound recording", 2, "Load mlv_snd in Magic Lantern's Modules tab"); break;
+        case SI_CHECK_CROP: case SI_CHECK_RAW: case SI_CHECK_EXPO:
+        {
+            /* nothing to switch here: the help line says what to do */
+            static struct settings_view chk;
+            build_settings(&chk);
+            for (int i = 0; i < chk.count; i++)
+                if (chk.row[i].id == id && chk.row[i].tone == ST_OK) { snprintf(msg, sizeof(msg), "All set"); break; }
+            if (!msg[0]) { snprintf(msg, sizeof(msg), "See the line below for how to fix it"); bad = 1; }
+            break;
+        }
+    }
+#undef CYCLE
+    mlog('S', id, bad, 0);
+    static struct settings_view fresh;
+    build_settings(&fresh);
+    settings_refresh(&fresh, now);
+    if (msg[0]) settings_toast(&sets, msg, bad, now);
 }
 
 /* ---------------------------------------------------------------- the overlay */
@@ -655,6 +1061,7 @@ static int overlay_begin(void)
     back.by0 = 0; back.by1 = UI_H;
     gfx_clip_all(&back);
     memset(back_buf, 0, UI_W * UI_H);       /* transparent: the quick bar only draws its rows */
+    zoom_restore = 0;                       /* opened again before zooming back: still punched in */
 
     /* ML's overlays step aside while the panel is up; Canon stops redrawing its own */
     saved_global_draw = menu_get_value_from_script("Overlay", "Global Draw");
@@ -682,6 +1089,10 @@ static void overlay_end(int why)
     overlay_active = 0;
     ov_mode = 0;
     panel_from_bar = 0;
+    settings_from_bar = 0;
+    if (zoom_before) zoom_restore = 1;      /* the task zooms back once idle (then records, for REC) */
+    if (welcome_mode) cfg_welcomed = 1;     /* seen, however it was closed */
+    welcome_mode = welcome_from_settings = 0;
     tap_pending = 0;
     panel.state = PS_CLOSED;
     qbar.state = QB_CLOSED;
@@ -830,6 +1241,18 @@ static void moth_task(void)
                     qb_fill(&qview);
                     qbar_open(&qbar, &qview, get_ms_clock());
                     qview_read_at = get_ms_clock();
+                    if (bar_hint_seen)
+                    {
+                        /* after the first time: the most serious warning instead of the controls */
+                        struct warning w[1];
+                        if (collect_warnings(w, 1)) qbar_toast(&qbar, w[0].text, w[0].bad, get_ms_clock() + 200);
+                    }
+                    bar_hint_seen = 1;
+                }
+                else if (mode == OV_SETTINGS)
+                {
+                    build_settings(&sview);
+                    settings_open(&sets, &sview, get_ms_clock());
                 }
                 else
                 {
@@ -841,6 +1264,7 @@ static void moth_task(void)
             }
             open_request = 0;               /* an INFO that arrived while starting up is not a new request */
             opening = 0;
+            if (!overlay_active) welcome_mode = welcome_from_settings = 0;  /* could not open: next boot */
             continue;
         }
 
@@ -848,6 +1272,86 @@ static void moth_task(void)
         {
             /* the watchdog gave the buttons back while we were stuck: tidy up quietly */
             overlay_end(CLOSE_WATCHDOG);
+            continue;
+        }
+
+        if (overlay_active && ov_mode == OV_SETTINGS)
+        {
+            int k, closed = 0, go_back = 0;
+            int pending_tap = tap_pending;
+            tap_pending = 0;
+            while ((k = pop_key()) != PK_NONE || pending_tap)
+            {
+                repaint_until = now + 300;
+                if (k == PK_CLOSE_NOW) { overlay_end(CLOSE_KEY_PASS); closed = 1; break; }
+                int act;
+                if (k == PK_NONE) { act = settings_tap(&sets, &sview, tap_x, tap_y, now); pending_tap = 0; }
+                else act = settings_key(&sets, &sview, k, now);
+                if (act == SA_ACTIVATE && sets.act_id == SI_WELCOME_DONE) { go_back = 1; break; }
+                if (act == SA_ACTIVATE) { settings_activate(sets.act_id, now); now = get_ms_clock(); }
+                if (act == SA_CLOSE) { go_back = 1; break; }
+            }
+            if (closed) continue;
+            if (go_back && welcome_mode)
+            {
+                cfg_welcomed = 1;
+                welcome_mode = 0;
+                if (welcome_from_settings)
+                {
+                    /* back to the settings page it came from */
+                    welcome_from_settings = 0;
+                    static struct settings_view fresh;
+                    build_settings(&fresh);
+                    sview = fresh;
+                    sets.open = 1;          /* INFO closed the welcome's view of the page */
+                    settings_rebuilt(&sets, &sview, SI_WELCOME, now);
+                    continue;
+                }
+            }
+            if (go_back)
+            {
+                if (settings_from_bar)
+                {
+                    settings_from_bar = 0;
+                    memset(back_buf, 0, UI_W * UI_H);
+                    present_rows(0, UI_H);
+                    ov_mode = OV_BAR;
+                    qb_fill(&qview);
+                    qbar_open(&qbar, &qview, now);
+                    qview_read_at = now;
+                    mlog('O', cfg_theme, profile_count, OV_BAR);
+                }
+                else overlay_end(CLOSE_KEY);
+                continue;
+            }
+
+            /* values Canon or ML change meanwhile (battery, a module's state): twice a second */
+            if (now - qview_read_at > 500)
+            {
+                static struct settings_view fresh;
+                build_settings(&fresh);
+                if (memcmp(&fresh, &sview, sizeof(fresh))) settings_refresh(&fresh, now);
+                qview_read_at = now;
+            }
+
+            if (!lv != !was_lv) { mlog('L', lv ? 1 : 0, 0, 0); was_lv = lv; }
+            int why = gui_menu_shown() ? CLOSE_MENU : RECORDING ? CLOSE_REC :
+                      !is_movie_mode() ? CLOSE_PHOTO : !display_is_on() ? CLOSE_DISPLAY : 0;
+            if (!lv)
+            {
+                if (!lv_lost_at) lv_lost_at = now ? now : 1;
+                if (now - lv_lost_at > (zoom_job ? 4000u : 700u)) why = CLOSE_LV;
+            }
+            else lv_lost_at = 0;
+            if (why) { overlay_end(why); continue; }
+
+            struct present out;
+            last_frame_ms = now;
+            int fl = settings_frame(&sets, &sview, &back, now, &out);
+            if (fl & PF_PRESENTED) present(&out);
+            if ((int32_t)(repaint_until - now) > 0) present_full();
+            else if (screen_was_disturbed()) { present_full(); mlog('R', 0, 0, 0); }
+            msleep(20);
             continue;
         }
 
@@ -873,8 +1377,21 @@ static void moth_task(void)
                 }
                 if (act == QA_LOCKED) qbar_toast(&qbar, qb_locked_reason(qbar.adj_item), 0, now);
                 if (act == QA_OPEN_PANEL) { to_panel = 1; break; }
+                if (act == QA_OPEN_SETTINGS) { to_panel = 2; break; }
             }
             if (closed) continue;
+
+            if (to_panel == 2)
+            {
+                memset(back_buf, 0, UI_W * UI_H);
+                qbar.state = QB_CLOSED;
+                ov_mode = OV_SETTINGS;
+                settings_from_bar = 1;
+                build_settings(&sview);
+                settings_open(&sets, &sview, now);
+                mlog('O', cfg_theme, profile_count, OV_SETTINGS);
+                continue;
+            }
 
             if (to_panel)
             {
@@ -906,7 +1423,7 @@ static void moth_task(void)
             if (!lv)
             {
                 if (!lv_lost_at) lv_lost_at = now ? now : 1;
-                if (now - lv_lost_at > 700u) why = CLOSE_LV;
+                if (now - lv_lost_at > (zoom_job ? 4000u : 700u)) why = CLOSE_LV;
             }
             else lv_lost_at = 0;
             if (why) { overlay_end(why); continue; }
@@ -993,6 +1510,33 @@ static void moth_task(void)
             continue;
         }
 
+        if (!overlay_active) zoom_restore_step();
+
+        /* the first start after installing: the welcome page, once LiveView has settled */
+        {
+            static uint32_t calm_since;
+            int calm = !overlay_active && lv && is_movie_mode() && !RECORDING && !gui_menu_shown() &&
+                       display_is_on() && apply_helper != 1 && !open_request;
+            if (!calm) calm_since = 0;
+            else if (!calm_since) calm_since = now | 1;
+            if (!cfg_welcomed && !welcome_tried && calm && now - calm_since > 2500)
+            {
+                welcome_tried = 1;
+                welcome_mode = 1;
+                open_request = OV_SETTINGS;
+            }
+        }
+        if (rec_after_zoom && !overlay_active)
+        {
+            if (!zoom_job && !zoom_restore && lv_dispsize != 10 && lv && !RECORDING)
+            {
+                rec_after_zoom = 0;
+                mlog('E', QB_FOCUS, 0, 2);
+                module_send_keypress(MODULE_KEY_REC);
+            }
+            else if (now - rec_after_zoom > 4000) { rec_after_zoom = 0; mlog('E', QB_FOCUS, 0, 3); }
+        }
+
         if (log_dirty && !RECORDING && apply_helper != 1 && !logging()) log_flush();
 
         watch_recording(now);
@@ -1032,6 +1576,12 @@ static unsigned int moth_keypress_cbr(unsigned int key)
             release_gui_state();
             handing_back = 1;
             push_key(PK_CLOSE_NOW);
+            if ((key == MODULE_KEY_REC || key == MODULE_KEY_LV) && zoom_before && lv_dispsize == 10)
+            {
+                /* RAW cannot record at x10: zoom back first (the task does it), then record */
+                rec_after_zoom = get_ms_clock() | 1;
+                return 0;
+            }
             if (key == MODULE_KEY_REC || key == MODULE_KEY_LV || key == MODULE_KEY_PLAY ||
                 key == MODULE_KEY_TOUCH_2_FINGER)
             {
@@ -1102,11 +1652,11 @@ static unsigned int moth_keypress_raw_cbr(unsigned int raw)
         int x, y; uint32_t v;
         int ok = touch_pos(&x, &y, &v);
         mlog_v('Y', e->param, e->arg, 0, (uint32_t)(uintptr_t)e->obj);
-        if (e->param == EOSM_UNTOUCH_1 && ok && ov_mode == OV_BAR)
+        if (e->param == EOSM_UNTOUCH_1 && ok && (ov_mode == OV_BAR || ov_mode == OV_SETTINGS))
         {
             tap_x = x; tap_y = y; tap_pending = 1;
         }
-        mlog_v('X', e->param, e->param == EOSM_UNTOUCH_1 && ok && ov_mode == OV_BAR, 0, v);
+        mlog_v('X', e->param, e->param == EOSM_UNTOUCH_1 && ok && (ov_mode == OV_BAR || ov_mode == OV_SETTINGS), 0, v);
     }
     if (e && e->type == 0)
         switch (e->param)
@@ -1147,10 +1697,18 @@ static MENU_UPDATE_FUNC(learned_update)
                   bpp.x100[2] / 100, bpp.x100[2] % 100, bpp.x100[4] / 100, bpp.x100[4] % 100);
 }
 
-static MENU_SELECT_FUNC(learned_reset)
+static void learned_reset_now(void)
 {
     cfg_learned = cfg_bpp10 = cfg_bpp11 = cfg_bpp12 = cfg_bpp14 = 0;
     bpp_from_config();
+}
+
+static MENU_SELECT_FUNC(learned_reset) { learned_reset_now(); }
+
+static MENU_SELECT_FUNC(open_settings_from_menu)
+{
+    open_request = OV_SETTINGS;
+    gui_stop_menu();
 }
 
 static MENU_UPDATE_FUNC(about_update)
@@ -1171,6 +1729,7 @@ static struct menu_entry moth_menu[] =
         .depends_on = DEP_MOVIE_MODE,
         .children = (struct menu_entry[]) {
             { .name = "Open profiles", .select = open_from_menu, .help = "Choose and apply a recording profile." },
+            { .name = "Settings", .select = open_settings_from_menu, .help = "Mothlight's settings page: look, card, sound, aids, profiles." },
             {
                 .name = "Theme", .priv = &cfg_theme, .max = THEME_COUNT - 1,
                 .choices = CHOICES("Mothlight", "Stock", "Studio", "Amber", "Signal", "Material",

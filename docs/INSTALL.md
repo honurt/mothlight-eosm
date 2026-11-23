@@ -36,8 +36,13 @@ Eject the card properly, then put it in the camera.
 1. Turn the camera on in **photo mode**. If the firmware entry is greyed out, switch to a creative shooting
    mode (P, Tv, Av or M) first.
 2. *Menu > Setup > Firmware Ver. 2.0.2*, then start the update.
-3. The Magic Lantern installer starts (it is `ML-SETUP.FIR`, not a Canon firmware). It sets the camera's
-   **boot flag** and makes the card bootable. Follow the screen, then restart the camera.
+3. A plain screen titled **"Magic Lantern install"** appears. That is expected: it is `ML-SETUP.FIR`, the
+   Magic Lantern installer Mothlight is built on (not a Canon firmware). It sets the camera's **boot flag** and
+   makes the card bootable. When it says *Please restart your camera*, switch off and on.
+
+   Why it doesn't look like Mothlight: that file is encrypted for Canon's bootloader and only Magic Lantern's
+   maintainers can build it. It is also the code that writes the boot flag, so Mothlight ships it untouched
+   rather than risk the one step that could hurt the camera. You only see it once per camera.
 
 The boot flag tells the camera to look for `autoexec.bin` on a *bootable* card at power on. A normal card (not
 made bootable by the installer) starts the camera as usual. **A bootable card without `autoexec.bin` does not:**
@@ -50,9 +55,13 @@ If the camera ever locks up, take the battery out at once (a stuck processor get
 
 - Magic Lantern's menu: **tap the screen with two fingers**. The *Modules* tab shows what loads; Mothlight turns on crop_rec, mlv_lite, mlv_snd, mlv_play,
   sd_uhs, file_man and moth_ui.
-- Switch to **movie mode** and press **INFO**: the Mothlight panel opens.
-- Set *Debug > SD Overclock* to **160MHz** and restart if you want 3K / 2.8K. Then measure the card in
-  *Debug > Benchmarks > Card benchmark* and enter the result under *Movie > Mothlight > Card write speed*.
+- Switch to **movie mode**. After a few seconds Mothlight's **Welcome** page opens: how the buttons work, and a
+  setup check (Crop Mood, RAW recording, SD speed, movie exposure, sound). *Start shooting* closes it; it comes
+  back from *Settings > About > Welcome and setup check*.
+- Press **INFO** for the quick bar. Its **MENU** tile opens Mothlight's settings.
+- In Mothlight's settings, set *SD card speed (overclock)* to **160 MHz** and restart if you want 3K / 2.8K.
+  To be exact about your card, measure it in ML's *Debug > Benchmarks > Card benchmark* and enter the result
+  under *Card speed for OK / BURST*.
 
 ## Keep Canon one button away
 

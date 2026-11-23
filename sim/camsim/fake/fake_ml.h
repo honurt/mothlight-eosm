@@ -13,6 +13,7 @@
 struct cam_state
 {
     int lv_on, dispsize, recording, raw, movie, menu_shown, display_on, front_enabled;
+    int battery;                                 /* PROP_BATTERY_POWER: 0 low, 1 half, 2 full */
     int playback, canon_menu;
     struct {
         int focal_len, lens_exists;
@@ -26,6 +27,7 @@ int module_send_keypress(int module_key);
 
 #define lv            (cam.lv_on)
 #define lv_dispsize   (cam.dispsize)
+#define battery_level_bars (cam.battery)
 #define RECORDING     (cam.recording)
 #define RECORDING_RAW (cam.recording && cam.raw)
 #define lens_info     (cam.lens)

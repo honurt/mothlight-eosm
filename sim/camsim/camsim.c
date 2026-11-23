@@ -34,7 +34,7 @@
 
 struct cam_state cam;
 int gui_state;
-static int raw_recordings, h264_recordings;
+static int raw_recordings, h264_recordings, rec_at_x10;
 static const int shutters[] = { 33, 40, 50, 60, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000 };
 static const int fstops10[] = { 14, 16, 18, 20, 22, 25, 28, 32, 35, 40, 45, 50, 56, 63, 71, 80, 90, 100, 110, 130, 140, 160, 180, 200, 220 };
 static const int isos[] = { 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400 };
@@ -64,6 +64,7 @@ static int frames_checked, settled_mismatch;
 static const char * dump_dir;
 static int dump_n;
 static int global_draw_at_start = 1;
+static int soak_settings_frames, soak_x10_frames;
 static int begin_pending;                  /* overlay_begin() is between its first call and overlay_active = 1 */
 
 /* menus: (menu, entry) -> value; missing entries model unloaded modules */
@@ -82,6 +83,11 @@ static struct mval menus[] = {
     { "Crop mood", "Bit-depth", 0, 1 },
     { "Overlay", "Global Draw", 1, 1 },
     { "Debug", "SD Overclock", 2, 1 },
+    { "RAW video", "Sound recording", 0, 1 },
+    { "RAW video", "Small hacks", 1, 1 },
+    { "Overlay", "Zebras", 0, 1 },
+    { "Overlay", "Focus Peak", 0, 1 },
+    { "Overlay", "False color", 0, 1 },
 };
 static struct mval * find_menu(const char * m, const char * e)
 {
@@ -202,6 +208,7 @@ static int ov_settled(void)
 {
     if (!overlay_active || !back_buf) return 0;
     if (ov_mode == OV_BAR) return qbar_settled(&qbar);
+    if (ov_mode == OV_SETTINGS) return settings_settled(&sets);
     return panel_settled(&panel);
 }
 
@@ -235,10 +242,22 @@ static void check_visible(void)
 /* the card: files the module writes */
 static char logfile[65536];
 static int logfile_len, logfile_writes, logfile_writes_recording;
-static struct { int open; } the_file;
+static struct { int open, profiles; } the_file;
+static char profiles_written[16384];        /* PROFILES.TXT as the module wrote it */
+static int profiles_written_len, profiles_writes, fail_profiles_write;
+static const char * profiles_txt;           /* NULL: no PROFILES.TXT on the card */
 FILE * FIO_CreateFile(const char * name)
 {
+    if (!strcmp(name, "ML/SETTINGS/PROFILES.TXT"))
+    {
+        if (cam.recording) FAIL("PROFILES.TXT written while recording");
+        if (fail_profiles_write) return 0;
+        profiles_written_len = 0; profiles_written[0] = 0; profiles_writes++;
+        the_file.open = 1; the_file.profiles = 1;
+        return (FILE *) &the_file;
+    }
     if (strcmp(name, "ML/LOGS/MOTHLOG.TXT")) { FAIL("unexpected file %s", name); return 0; }
+    the_file.profiles = 0;
     logfile_len = 0; logfile_writes++;
     if (cam.recording) logfile_writes_recording++;
     the_file.open = 1;
@@ -246,11 +265,18 @@ FILE * FIO_CreateFile(const char * name)
 }
 int FIO_WriteFile(FILE * f, const void * p, size_t n)
 {
+    if (the_file.profiles)
+    {
+        if (n > sizeof(profiles_written) - 1 - profiles_written_len) n = sizeof(profiles_written) - 1 - profiles_written_len;
+        memcpy(profiles_written + profiles_written_len, p, n); profiles_written_len += n;
+        profiles_written[profiles_written_len] = 0;
+        return n;
+    }
     if (n > sizeof(logfile) - logfile_len) n = sizeof(logfile) - logfile_len;
     memcpy(logfile + logfile_len, p, n); logfile_len += n; logfile[logfile_len < (int)sizeof(logfile) ? logfile_len : (int)sizeof(logfile) - 1] = 0;
     return n;
 }
-void FIO_CloseFile(FILE * f) { the_file.open = 0; }
+void FIO_CloseFile(FILE * f) { if (the_file.profiles) profiles_txt = profiles_written; the_file.open = 0; the_file.profiles = 0; }
 
 /* ---------------------------------------------------------------- Canon */
 
@@ -337,6 +363,7 @@ static void gui_event_x(int canon, int fake)
     {
         cam.recording = !cam.recording; cam.raw = 1;
         if (cam.recording) raw_recordings++;
+        if (cam.recording && cam.dispsize == 10) rec_at_x10++;
         return;
     }
 
@@ -641,7 +668,6 @@ static struct card_info the_card;
 struct card_info * get_shooting_card(void) { return &the_card; }
 int get_free_space_32k(struct card_info * c) { return 32 * 1000 * 30; }
 
-static const char * profiles_txt;           /* NULL: no PROFILES.TXT on the card */
 const char * get_config_dir(void) { return "ML/SETTINGS/"; }
 void * read_entire_file(const char * path, int * size)
 {
@@ -686,6 +712,9 @@ static void post_frame_checks(void)
     }
     if (getenv("TRACE2") && now_ms > (uint32_t)atoi(getenv("TRACE2"))) fprintf(stderr, "    f @%u ov %d mode %d qb %d pfb %d st %d half %d lv %d movie %d menu %d disp %d apply %d hb %d kr %d ring %d/%d bp %d\n", now_ms, overlay_active, ov_mode, qbar.state, panel_from_bar, panel.state, tween_value(&panel.reveal, now_ms), cam.lv_on, cam.movie, cam.menu_shown, cam.display_on, apply_phase, handing_back, keys_released, key_head, key_tail, begin_pending);
     if (overlay_active) begin_pending = 0;
+    /* what Global Draw must be once closed: as it was, or as Settings > ML overlays chose */
+    if (overlay_active && saved_global_draw >= 0) global_draw_at_start = saved_global_draw;
+    if (overlay_active) { if (ov_mode == OV_SETTINGS) soak_settings_frames++; if (cam.dispsize == 10) soak_x10_frames++; }
     if (!overlay_active && !begin_pending && gui_state == MOTH_GUI_STATE)
         FAIL("ML's gui_state left at Mothlight's value with the panel closed");
     if (was_overlay && !overlay_active && !begin_pending)
@@ -703,16 +732,18 @@ static void post_frame_checks(void)
 
 /* ---------------------------------------------------------------- scenario helpers */
 
+static int want_welcome;
 static void boot(void)
 {
     memset(&cam, 0, sizeof(cam));
-    cam.lv_on = 1; cam.movie = 1; cam.display_on = 1; cam.front_enabled = 1; cam.dispsize = 1;
+    cam.lv_on = 1; cam.movie = 1; cam.display_on = 1; cam.front_enabled = 1; cam.dispsize = 1; cam.battery = 2;
     cam.lens.focal_len = 22;
     cam.lens.lens_exists = 1;
     cam.lens.raw_iso = 72 + iso_i * 3;
     cam.lens.wb_mode = WB_KELVIN; cam.lens.kelvin = 5600;
     lens_sync();
     if (!getenv("KEEP_KEY")) cfg_key = 2;   /* most scenarios test the profile panel; bar ones set 1 */
+    if (!want_welcome) cfg_welcomed = 1;    /* the first-start page has its own scenario */
     bmp = cam_malloc(BMPPITCH * 480);
     heap_live = 0;                          /* the screen is not the module's */
     memset(bmp, 0, BMPPITCH * 480);
@@ -785,7 +816,9 @@ static void select_profile(int idx);
 static int screen_says(const char * text)
 {
     ui_text_drawn_reset();
-    if (ov_mode == OV_BAR) qbar.full_redraw = 1; else panel.full_redraw = 1;
+    if (ov_mode == OV_BAR) qbar.full_redraw = 1;
+    else if (ov_mode == OV_SETTINGS) sets.full_redraw = 1;
+    else panel.full_redraw = 1;
     run_for(60);
     return strstr(ui_text_drawn, text) != 0;
 }
@@ -971,7 +1004,8 @@ static void s_qbar_basic(void)
     bar_select(QB_WB);
     tap(K_DOWN, 30); run_for(200);
     EXPECT(cam.lens.kelvin == 5500 && screen_says("5500K"), "DOWN on WB: %uK", cam.lens.kelvin);
-    tap(K_SET, 30); tap(K_SET, 30); run_for(200);
+    for (int i = QB_WB; i < QB_COUNT; i++) tap(K_SET, 30);
+    run_for(200);
     EXPECT(qbar.sel == QB_SHUTTER, "SET does not wrap around (sel %d)", qbar.sel);
     EXPECT(!canon_got[K_DOWN] && !canon_got[K_UP] && !canon_got[K_QSET], "bar keys leaked to Canon");
     printf("    worst overdraw with the bar: %d ms\n", worst_overdraw);
@@ -996,7 +1030,7 @@ static void s_qbar_locked(void)
 {
     auto_expo = 1;
     boot(); open_bar();
-    EXPECT(screen_says("Auto") && screen_says("auto (Canon)"), "auto exposure not shown:\n%s", ui_text_drawn);
+    EXPECT(screen_says("Auto") && screen_says("by Canon"), "auto exposure not shown:\n%s", ui_text_drawn);
     bar_select(QB_SHUTTER);
     tap(K_UP, 30); run_for(200);
     EXPECT(lens_changes == 0 && screen_says("Movie exposure to Manual"), "UP on automatic shutter: no explanation\n%s", ui_text_drawn);
@@ -1047,11 +1081,11 @@ static void s_qbar_to_panel(void)
 static void s_qbar_touch(void)
 {
     boot(); open_bar();
-    touch_at(3 * 144 + 60, 450);            /* WB tile */
+    touch_at(qb_tile_x[QB_WB] + 30, 450);      /* WB tile */
     EXPECT(qbar.sel == QB_WB, "tap on WB did not select it (sel %d)", qbar.sel);
-    touch_at(4 * 144 + 60, 440);            /* PROFILE: select ... */
+    touch_at(qb_tile_x[QB_PROFILE] + 60, 440); /* PROFILE: select ... */
     EXPECT(qbar.sel == QB_PROFILE && ov_mode == OV_BAR, "tap on PROFILE: sel %d mode %d", qbar.sel, ov_mode);
-    touch_at(4 * 144 + 60, 440);            /* ... and a second tap opens the list */
+    touch_at(qb_tile_x[QB_PROFILE] + 60, 440); /* ... and a second tap opens the list */
     run_for(600);
     EXPECT(ov_mode == OV_PANEL, "second tap on PROFILE did not open the list");
     tap(K_INFO, 0); run_for(800);
@@ -1523,7 +1557,8 @@ static void s_soak(void)
     srand(seed);
     boot();
     static const int keys[] = { K_UP, K_DOWN, K_LEFT, K_RIGHT, K_WL, K_WR, K_SET, K_INFO, K_INFO, K_INFO,
-                                K_HALF, K_TOUCH, K_UNHANDLED, K_OLC, K_DOOR, K_REC, K_MENU, K_PLAY };
+                                K_HALF, K_TOUCH, K_UNHANDLED, K_OLC, K_DOOR, K_REC, K_MENU, K_PLAY,
+                                K_SET, K_UP, K_UP, K_TOUCH2 };
     int opens = 0;
     for (int step = 0; step < 4000; step++)
     {
@@ -1540,6 +1575,7 @@ static void s_soak(void)
         else if (r < 90) { ui_stall_once = 1000 + rand() % 2500; }
         else if (r < 91) { canon_periodic_ms = canon_periodic_ms ? 0 : 900; }
         else if (r < 93) { cfg_key = 1 + rand() % 2; }   /* INFO opens the bar or the profiles */
+        else if (r < 94) { cam.battery = rand() % 3; }
         else if (r < 95) { touch_raw = rand() % 3 ? (uint32_t)((rand() % 480) << 16 | (rand() % 720)) : (uint32_t)rand();
                            gui_event(K_TOUCH); run_for(rand() % 80); gui_event(K_UNTOUCH); }
         run_for(rand() % 150);
@@ -1554,10 +1590,12 @@ static void s_soak(void)
     run_for(1000);
     EXPECT(!overlay_active && cam.front_enabled, "soak: did not end closed and clean");
     EXPECT(heap_live == 0, "soak: %ld bytes leaked", heap_live);
-    EXPECT(menu_val("Overlay", "Global Draw") == 1, "soak: Global Draw left off");
+    EXPECT(menu_val("Overlay", "Global Draw") == global_draw_at_start, "soak: Global Draw left at %d (chosen %d)",
+           menu_val("Overlay", "Global Draw"), global_draw_at_start);
+    EXPECT(cam.dispsize != 10 || zoom_before == 0, "soak: left punched in at x10");
     EXPECT(opens > 100, "soak: panel was barely open (%d steps), test not meaningful", opens);
-    printf("    soak seed %u: %d steps with the panel open, %d frames checked, %u s simulated\n",
-           seed, opens, frames_checked, now_ms / 1000);
+    printf("    soak seed %u: %d steps open (%d frames on Settings, %d at x10), %d frames checked, %u s simulated\n",
+           seed, opens, soak_settings_frames, soak_x10_frames, frames_checked, now_ms / 1000);
     open_panel();                           /* and it still works */
     finish();
 }
@@ -1613,6 +1651,323 @@ static void s_text_fits(void)
     }
 }
 
+
+/* ---------------------------------------------------------------- settings page */
+
+static void open_settings(void)
+{
+    open_bar();
+    bar_select(QB_MENU);
+    tap(K_UP, 30); run_for(500);
+    EXPECT(overlay_active && ov_mode == OV_SETTINGS, "UP on MENU did not open Settings (mode %d)", ov_mode);
+}
+
+static int sel_id(void) { return sets.sel >= 0 && sets.sel < sview.count ? sview.row[sets.sel].id : -1; }
+
+static void settings_goto(int id)
+{
+    for (int i = 0; i < SET_MAX_ROWS + 2 && sel_id() != id; i++) { tap(K_DOWN, 30); run_for(60); }
+    EXPECT(sel_id() == id, "could not reach settings item %d (on %d)", id, sel_id());
+}
+
+static void settings_set(int id) { settings_goto(id); tap(K_SET, 30); run_for(250); }
+
+static struct menu_entry * menu_child(const char * name)
+{
+    for (struct menu_entry * c = menu_root->children; c && c->name; c++)
+        if (!strcmp(c->name, name)) return c;
+    return 0;
+}
+
+static void s_settings_basic(void)
+{
+    boot(); open_settings();
+    EXPECT(screen_says("Settings") && screen_says("Theme") && screen_says("LOOK"), "Settings page not drawn:\n%s", ui_text_drawn);
+    EXPECT(gui_state != 0, "gui_state not held on the settings page");
+    /* every row, both ways: nothing leaves the screen, every help line fits */
+    ui_text_overflows = 0;
+    int n = 0;
+    for (int i = 0; i < SET_MAX_ROWS; i++) { tap(K_DOWN, 30); run_for(80); n++; }
+    for (int i = 0; i < SET_MAX_ROWS; i++) { tap(K_UP, 30); run_for(80); }
+    EXPECT(ui_text_overflows == 0, "%d strings overflowed on the settings page (last: %s)", ui_text_overflows, ui_text_overflow_last);
+    EXPECT(!canon_got[K_DOWN] && !canon_got[K_UP] && !canon_got[K_QSET], "settings keys leaked to Canon");
+    EXPECT(ml_redraws == 0, "ML's long-press redraw ran on the settings page (black flash)");
+    /* theme: SET tries the next one right here */
+    int t0 = cfg_theme;
+    settings_set(SI_THEME);
+    EXPECT(cfg_theme == (t0 + 1) % THEME_COUNT && sview.theme == theme(), "SET on Theme: %d -> %d", t0, cfg_theme);
+    EXPECT(screen_says(theme_names[cfg_theme]), "new theme name not shown");
+    EXPECT(sel_id() == SI_THEME, "selection moved after changing the theme");
+    settings_set(SI_MOTION);
+    EXPECT(cfg_motion == 0, "Animations not switched off");
+    settings_set(SI_MOTION);
+    /* INFO: back to the bar, INFO again: closed */
+    tap(K_INFO, 0); run_for(500);
+    EXPECT(overlay_active && ov_mode == OV_BAR && qbar.state == QB_OPEN, "INFO on Settings did not go back to the bar (mode %d)", ov_mode);
+    tap(K_INFO, 0); run_for(600);
+    EXPECT(!overlay_active && gui_state == 0, "bar did not close after Settings");
+    finish();
+}
+
+static void s_settings_ml_items(void)
+{
+    boot(); open_settings();
+    find_menu("Debug", "SD Overclock")->value = 0;
+    run_for(600);
+    settings_set(SI_SDCLOCK);
+    EXPECT(menu_val("Debug", "SD Overclock") == 1 && screen_says("160 MHz") && screen_says("Restart the camera"),
+           "SD speed: %d\n%s", menu_val("Debug", "SD Overclock"), ui_text_drawn);
+    for (int i = 0; i < 3; i++) { tap(K_SET, 30); run_for(150); }
+    EXPECT(menu_val("Debug", "SD Overclock") == 0, "SD speed does not wrap around to Off");
+    settings_set(SI_SOUND);
+    EXPECT(menu_val("RAW video", "Sound recording") == 1, "Sound not switched on");
+    settings_set(SI_SOUND);
+    settings_set(SI_HACKS);
+    EXPECT(menu_val("RAW video", "Small hacks") == 2, "Small hacks: %d", menu_val("RAW video", "Small hacks"));
+    settings_set(SI_ZEBRAS);
+    settings_set(SI_PEAK);
+    settings_set(SI_FALSECOLOR);
+    EXPECT(menu_val("Overlay", "Zebras") == 1 && menu_val("Overlay", "Focus Peak") == 1 && menu_val("Overlay", "False color") == 1,
+           "aids not switched on");
+    int card0 = cfg_card;
+    settings_set(SI_CARD);
+    EXPECT(cfg_card != card0, "card speed did not change");
+    /* ML overlays: Global Draw stays off while open, the choice applies on closing */
+    EXPECT(menu_val("Overlay", "Global Draw") == 0, "Global Draw on while Mothlight is open");
+    settings_set(SI_OVERLAYS);
+    EXPECT(screen_says("Off"), "ML overlays not shown as Off");
+    EXPECT(menu_val("Overlay", "Global Draw") == 0, "Global Draw switched on while Mothlight is open");
+    close_panel(); run_for(300);
+    EXPECT(menu_val("Overlay", "Global Draw") == 0, "ML overlays Off was not kept after closing");
+    find_menu("Overlay", "Global Draw")->value = 1;
+    global_draw_at_start = 1;
+    /* a module that is not loaded: shown, and explained */
+    set_exists("RAW video", "Sound recording", 0);
+    open_settings();
+    EXPECT(screen_says("not loaded"), "missing mlv_snd not shown");
+    settings_set(SI_SOUND);
+    EXPECT(screen_says("Load mlv_snd"), "SET on a missing module: no explanation\n%s", ui_text_drawn);
+    finish();
+}
+
+static void s_settings_from_ml_menu(void)
+{
+    boot();
+    cam.menu_shown = 1;
+    struct menu_entry * e = menu_child("Settings");
+    EXPECT(e && e->select, "no Mothlight > Settings in ML's menu");
+    if (e) e->select(0, 1);
+    run_for(1200);
+    EXPECT(overlay_active && ov_mode == OV_SETTINGS, "Mothlight > Settings did not open the page (mode %d)", ov_mode);
+    tap(K_INFO, 0); run_for(600);
+    EXPECT(!overlay_active, "INFO on Settings opened from the menu did not close it");
+    /* REC and two-finger tap leave the page like they leave the bar */
+    open_panel(); close_panel();
+    open_settings();
+    tap(K_TOUCH2, 0); run_for(300);
+    EXPECT(!overlay_active && cam.menu_shown, "two-finger tap on Settings did not open ML's menu");
+    cam.menu_shown = 0; run_for(200);
+    open_settings();
+    menu_set_value_from_script("Movie", "RAW video", 1);
+    tap(K_REC, 0); run_for(300);
+    EXPECT(!overlay_active && raw_recordings == 1, "REC on Settings: overlay %d, %d RAW", overlay_active, raw_recordings);
+    cam.recording = 0; run_for(3500);
+    finish();
+}
+
+static void s_settings_touch(void)
+{
+    boot(); open_settings();
+    int y = 0, target = -1;
+    /* the third item row on screen: tap selects, a second tap activates */
+    for (int i = 0, items = 0; i < sview.count; i++)
+        if (sview.row[i].kind == SR_ITEM && ++items == 3) { target = sview.row[i].id; break; }
+    for (int k = 0; k < 400 && sel_id() != target; k += 4)
+    {
+        y = 60 + k;
+        touch_at(300, y);
+        if (sel_id() == target) break;
+    }
+    EXPECT(sel_id() == target, "tapping did not select item %d (on %d)", target, sel_id());
+    int key0 = cfg_key;
+    touch_at(300, y); run_for(200);
+    EXPECT(target != SI_INFO || cfg_key != key0, "a second tap did not change the item");
+    if (target == SI_INFO) { while (cfg_key != key0) { touch_at(300, y); run_for(150); } }
+    finish();
+}
+
+static void s_warnings(void)
+{
+    auto_expo = 1;
+    boot();
+    open_panel(); select_profile(find_profile(MOOD_3X3)); tap(K_SET, 40); run_for(4000);
+    if (overlay_active) close_panel();
+    cam.battery = 0;
+    find_menu("Debug", "SD Overclock")->value = 0;
+    find_menu("RAW video", "Sound recording")->value = 1;
+    open_bar(); close_panel();
+    open_bar();                             /* second time: the worst warning in the strip */
+    EXPECT(screen_says("Battery low"), "low battery not in the bar's strip:\n%s", ui_text_drawn);
+    EXPECT(screen_says("warnings"), "MENU tile does not count the warnings");
+    bar_select(QB_MENU); tap(K_UP, 30); run_for(500);
+    EXPECT(screen_says("Battery low") && screen_says("Movie exposure is Auto") && screen_says("SD Overclock is off"),
+           "warnings missing on the settings page:\n%s", ui_text_drawn);
+    int w0 = sview.warn_count;
+    EXPECT(w0 >= 3, "only %d warnings", w0);
+    /* fixing one from the page: the selection stays on its item although the rows move up */
+    settings_goto(SI_SOUND);
+    settings_set(SI_SOUND);
+    run_for(700);
+    EXPECT(sel_id() == SI_SOUND, "selection jumped after a warning went away (on %d)", sel_id());
+    cam.battery = 2; run_for(700);
+    EXPECT(sview.warn_count < w0 && sel_id() == SI_SOUND, "battery warning still shown, or selection moved (%d warnings, on %d)",
+           sview.warn_count, sel_id());
+    finish();
+}
+
+static void s_save_profile(void)
+{
+    boot();
+    int n0 = profile_count;
+    /* Crop Mood set by hand to something no profile has */
+    find_menu("Movie", "Crop mood")->value = MOOD_1X1;
+    find_menu("Crop mood", "Preset:")->value = 3;
+    find_menu("Crop mood", "Aspect ratio:")->value = 1;
+    find_menu("Crop mood", "Framerate:")->value = 0;
+    find_menu("Crop mood", "Bit-depth")->value = 2;
+    open_settings();
+    settings_set(SI_SAVE);
+    EXPECT(profiles_writes == 1, "PROFILES.TXT written %d times", profiles_writes);
+    EXPECT(profile_count == n0 + 1, "profile count %d -> %d", n0, profile_count);
+    EXPECT(cfg_active == profile_count - 1 && !strncmp(profiles[cfg_active].name, "My ", 3),
+           "new profile not active (%d, %s)", cfg_active, cfg_active >= 0 ? profiles[cfg_active].name : "-");
+    EXPECT(screen_says("Saved as"), "no confirmation\n%s", ui_text_drawn);
+    EXPECT(strstr(profiles_written, "2.5K Cinema |") && strstr(profiles_written, profiles[cfg_active].name),
+           "PROFILES.TXT lacks the built-ins or the new one:\n%s", profiles_written);
+    /* the same again: not a duplicate */
+    tap(K_SET, 30); run_for(250);
+    EXPECT(profiles_writes == 1 && profile_count == n0 + 1 && screen_says("Already saved"), "saved a duplicate");
+    /* it is a real profile: it shows in the list and applies */
+    close_panel();
+    cfg_key = 2; open_panel();
+    EXPECT(screen_says(profiles[profile_count - 1].name), "saved profile not in the list");
+    close_panel();
+    /* crop_rec missing: nothing written, and said why */
+    set_exists("Movie", "Crop mood", 0);
+    open_settings(); settings_set(SI_SAVE);
+    EXPECT(profiles_writes == 1 && screen_says("Load crop_rec"), "save without crop_rec: %d writes", profiles_writes);
+    set_exists("Movie", "Crop mood", 1);
+    /* the card refuses the file */
+    find_menu("Crop mood", "Bit-depth")->value = 0;
+    fail_profiles_write = 1;
+    tap(K_SET, 30); run_for(250);
+    EXPECT(profile_count == n0 + 1 && screen_says("Could not write"), "failed write not reported, or list changed");
+    fail_profiles_write = 0;
+    finish();
+}
+
+static void s_save_profile_full(void)
+{
+    static char many[4096];
+    int n = 0;
+    for (int i = 0; i < MAX_PROFILES; i++)
+        n += snprintf(many + n, sizeof(many) - n, "P%d | 1:1 | 2.5K | 2.35 | 23.976 | %d\n", i, 10 + (i % 3));
+    profiles_txt = many;
+    boot();
+    EXPECT(profile_count == MAX_PROFILES, "%d profiles loaded", profile_count);
+    find_menu("Movie", "Crop mood")->value = MOOD_3X3;
+    open_settings(); settings_set(SI_SAVE);
+    EXPECT(profiles_writes == 0 && screen_says("profiles is the most"), "a 17th profile: %d writes\n%s", profiles_writes, ui_text_drawn);
+    finish();
+}
+
+static void s_focus_punch_in(void)
+{
+    boot();
+    open_panel(); select_profile(find_profile(MOOD_1X1)); tap(K_SET, 40); run_for(4000);
+    if (overlay_active) close_panel();
+    int z0 = cam.dispsize;
+    open_bar();
+    bar_select(QB_FOCUS);
+    EXPECT(screen_says("x"), "FOCUS tile shows no zoom");
+    tap(K_UP, 30); run_for(1500);
+    EXPECT(cam.dispsize == 10 && overlay_active && ov_mode == OV_BAR, "UP on FOCUS: zoom %d, overlay %d", cam.dispsize, overlay_active);
+    EXPECT(screen_says("x10") && screen_says("DOWN back"), "FOCUS tile not updated\n%s", ui_text_drawn);
+    tap(K_UP, 30); run_for(300);
+    EXPECT(screen_says("Already at x10"), "UP at x10: no message");
+    tap(K_DOWN, 30); run_for(1800);
+    EXPECT(cam.dispsize == z0, "DOWN on FOCUS: zoom %d (was %d)", cam.dispsize, z0);
+    /* closing while punched in: back to where we were */
+    tap(K_UP, 30); run_for(1500);
+    tap(K_INFO, 0); run_for(2000);
+    EXPECT(!overlay_active && cam.dispsize == z0, "closing at x10 left zoom %d", cam.dispsize);
+    /* closing while the zoom is still being set */
+    open_bar(); bar_select(QB_FOCUS);
+    tap(K_UP, 30); run_for(150);
+    tap(K_INFO, 0); run_for(3000);
+    EXPECT(!overlay_active && cam.dispsize == z0, "closing during the zoom left zoom %d", cam.dispsize);
+    /* REC while punched in: zoom back first, then record RAW */
+    open_bar(); bar_select(QB_FOCUS);
+    tap(K_UP, 30); run_for(1500);
+    EXPECT(cam.dispsize == 10, "no x10");
+    tap(K_REC, 0); run_for(3000);
+    EXPECT(raw_recordings == 1 && rec_at_x10 == 0 && cam.dispsize == z0,
+           "REC at x10: %d RAW, %d at x10, zoom %d", raw_recordings, rec_at_x10, cam.dispsize);
+    cam.recording = 0; run_for(3500);
+    /* zoomed by Canon (not by us): closing leaves it alone */
+    cam.dispsize = 10;
+    open_bar(); close_panel(); run_for(1500);
+    EXPECT(cam.dispsize == 10, "closing changed a zoom Mothlight did not set");
+    cam.dispsize = z0;
+    finish();
+}
+
+static void s_welcome(void)
+{
+    want_welcome = 1;
+    boot();
+    run_for(4000);
+    EXPECT(overlay_active && ov_mode == OV_SETTINGS && welcome_mode, "no welcome on the first start (overlay %d mode %d)", overlay_active, ov_mode);
+    EXPECT(screen_says("Welcome") && screen_says("is installed") && screen_says("SETUP CHECK") && screen_says("Ready"),
+           "welcome not drawn:\n%s", ui_text_drawn);
+    EXPECT(sel_id() == SI_WELCOME_DONE, "welcome does not start on 'Start shooting'");
+    ui_text_overflows = 0;
+    for (int i = 0; i < 12; i++) { tap(K_DOWN, 30); run_for(80); }
+    EXPECT(ui_text_overflows == 0, "%d strings overflowed on the welcome page (last: %s)", ui_text_overflows, ui_text_overflow_last);
+    settings_goto(SI_WELCOME_DONE);
+    tap(K_SET, 30); run_for(600);
+    EXPECT(!overlay_active && cfg_welcomed, "Start shooting did not close the welcome (overlay %d)", overlay_active);
+    run_for(6000);
+    EXPECT(!overlay_active, "the welcome came back");
+    /* from Settings > About it shows again, and back returns to Settings */
+    open_settings();
+    settings_set(SI_WELCOME);
+    EXPECT(welcome_mode && screen_says("HOW IT WORKS"), "Welcome and setup check did not show the page");
+    tap(K_INFO, 0); run_for(400);
+    EXPECT(overlay_active && ov_mode == OV_SETTINGS && !welcome_mode && sel_id() == SI_WELCOME, "back from the welcome: mode %d welcome %d on %d",
+           ov_mode, welcome_mode, sel_id());
+    finish();
+}
+
+static void s_welcome_waits(void)
+{
+    /* not over the ML menu, not in photo mode, not while recording: it waits for calm LiveView */
+    want_welcome = 1;
+    boot();
+    cam.movie = 0; run_for(5000);
+    EXPECT(!overlay_active, "welcome opened in photo mode");
+    cam.movie = 1; cam.menu_shown = 1; run_for(5000);
+    EXPECT(!overlay_active, "welcome opened over ML's menu");
+    cam.menu_shown = 0; run_for(1000);
+    EXPECT(!overlay_active, "welcome opened before LiveView calmed down");
+    run_for(3000);
+    EXPECT(overlay_active && welcome_mode, "welcome never opened");
+    tap(K_REC, 0); run_for(300);         /* REC closes it like any page, and counts as seen */
+    EXPECT(!overlay_active && cfg_welcomed, "REC did not close the welcome (or it was not marked seen)");
+    cam.recording = 0; run_for(3500);
+    finish();
+}
+
 /* ---------------------------------------------------------------- runner */
 
 struct sc { const char * name; void (*fn)(void); };
@@ -1662,6 +2017,16 @@ static const struct sc all[] = {
     { "animations off", s_reduced_motion },
     { "learning compression from a clip", s_learning },
     { "every profile x every theme: all text fits (23-char names too)", s_text_fits },
+    { "settings: open from the bar, every row, theme, back to the bar", s_settings_basic },
+    { "settings: ML's SD clock, sound, hacks, aids, overlays; missing modules", s_settings_ml_items },
+    { "settings: from ML's menu; REC and two-finger tap leave it", s_settings_from_ml_menu },
+    { "settings: tap selects, second tap changes", s_settings_touch },
+    { "smart warnings: bar strip, MENU tile, settings; selection stays put", s_warnings },
+    { "save Crop Mood's settings as a profile (duplicates, no crop_rec, card refuses)", s_save_profile },
+    { "save a profile when 16 exist", s_save_profile_full },
+    { "focus punch-in: x10, back, close, close mid-zoom, REC at x10", s_focus_punch_in },
+    { "welcome on the first start, and again from Settings", s_welcome },
+    { "welcome waits for calm movie LiveView", s_welcome_waits },
     { "soak: 4000 random steps of keys and camera events", s_soak },
 };
 

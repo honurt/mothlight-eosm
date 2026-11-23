@@ -1,0 +1,37 @@
+MOTHLIGHT for the Canon EOS M  --  install in 3 steps
+=====================================================
+
+Needs: the original EOS M (2012) on Canon firmware 2.0.2, a fast UHS-I card,
+and a charged battery. Back up the card first: step 1 erases it.
+
+1. FORMAT THE CARD IN THE CAMERA
+   Menu > Setup > Format card.
+
+2. COPY EVERYTHING FROM THIS FOLDER TO THE CARD
+   autoexec.bin, ML-SETUP.FIR and the ML folder, at the top of the card
+   (not inside another folder). Eject the card properly.
+
+3. RUN THE INSTALLER ONCE
+   Camera in photo mode (P, Tv, Av or M), then
+   Menu > Setup > Firmware Ver. 2.0.2 > update.
+   A plain screen titled "Magic Lantern install" appears. That is expected:
+   it is the Magic Lantern installer that Mothlight is built on. It makes
+   the card bootable and says "Please restart your camera" when done.
+   Switch the camera off and on.
+
+THEN
+   Switch to movie mode. After a few seconds Mothlight shows its Welcome
+   page with a setup check. Press SET on "Start shooting".
+
+   INFO ............ quick bar: shutter, aperture, ISO, WB, focus, profile
+   SET ............. next tile        UP / DOWN ..... change the value
+   MENU tile ....... Mothlight settings (theme, card speed, sound, aids)
+   Two-finger tap .. Magic Lantern's full menu
+
+GOOD TO KNOW
+ - Canon's firmware is never replaced. Hold SET while switching on to
+   start plain Canon.
+ - Never delete autoexec.bin from this card and keep using it: format
+   the card in the camera instead.
+ - If the camera ever freezes, take the battery out.
+ - Full guide: https://github.com/honurt/mothlight-eosm/blob/main/docs/INSTALL.md

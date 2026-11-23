@@ -103,6 +103,55 @@ char * profile_summary(const struct rec_profile * p, char * buf, int len)
     return buf;
 }
 
+/* ---- writing profiles back (the parser's words, in a readable case) */
+
+static const char * const w_modes[]  = { "off", "1:1", "1x3", "3x3" };
+static const char * const w_p11[]    = { "2.5K", "2.8K", "3K", "1440p", "1280p", "fullres" };
+static const char * const w_p13[]    = { "highest", "higher", "medium" };
+static const char * const w_p33[]    = { "hfr", "1080p" };
+static const char * const w_ratios[] = { "16:9", "2:1", "2.20", "2.35", "2.39" };
+static const char * const w_fps[]    = { "23.976", "25", "30" };
+static const char * const w_bits[]   = { "14", "12", "11", "10" };
+
+static const char * preset_word(const struct rec_profile * p)
+{
+    switch (p->mood)
+    {
+        case MOOD_1X1: return (p->preset >= 0 && p->preset < 6) ? w_p11[(int)p->preset] : "?";
+        case MOOD_1X3: return (p->preset >= 0 && p->preset < 3) ? w_p13[(int)p->preset] : "?";
+        case MOOD_3X3: return (p->preset >= 0 && p->preset < 2) ? w_p33[(int)p->preset] : "?";
+    }
+    return "";
+}
+
+int profile_format_line(const struct rec_profile * p, char * buf, int len)
+{
+    int m = (p->mood >= 0 && p->mood < 4) ? p->mood : 0;
+    if (m == MOOD_OFF)
+        return snprintf(buf, len, "%s | off |  |  |  | \n", p->name);
+    return snprintf(buf, len, "%s | %s | %s | %s | %s | %s\n", p->name, w_modes[m], preset_word(p),
+                    w_ratios[(p->ratio >= 0 && p->ratio < 5) ? p->ratio : 0],
+                    w_fps[(p->fps >= 0 && p->fps < 3) ? p->fps : 0],
+                    w_bits[(p->bits >= 0 && p->bits < 4) ? p->bits : 0]);
+}
+
+void profile_auto_name(const struct rec_profile * p, char * buf, int len)
+{
+    int r = (p->ratio >= 0 && p->ratio < 5) ? p->ratio : 0;
+    if (p->mood == MOOD_OFF)       snprintf(buf, len, "My Canon H.264");
+    else if (p->mood == MOOD_1X1)  snprintf(buf, len, "My %s %s %d-bit", preset_word(p), w_ratios[r], profile_bits(p));
+    else if (p->mood == MOOD_1X3)  snprintf(buf, len, "My 1x3 %s %s", preset_word(p), w_ratios[r]);
+    else                           snprintf(buf, len, "My 3x3 %s %d-bit", preset_word(p), profile_bits(p));
+    if (len > PROFILE_NAME_LEN) buf[PROFILE_NAME_LEN - 1] = 0;
+}
+
+int profile_same_setup(const struct rec_profile * a, const struct rec_profile * b)
+{
+    if (a->mood != b->mood) return 0;
+    if (a->mood == MOOD_OFF) return 1;
+    return a->preset == b->preset && a->ratio == b->ratio && a->fps == b->fps && a->bits == b->bits;
+}
+
 /* ---- built-in profiles: a sensible set for the EOS M, best first */
 
 static void add(struct rec_profile * out, int * n, int max, const char * name,

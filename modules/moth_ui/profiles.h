@@ -54,4 +54,13 @@ const char * profile_fps_str(const struct rec_profile * p);
 /* "3072x1308  10-bit  23.976" (or "1736x2178 1x3  10-bit  23.976"); returns buf */
 char * profile_summary(const struct rec_profile * p, char * buf, int len);
 
+/* one PROFILES.TXT line for p ("name | 1:1 | 2.5K | 2.35 | 23.976 | 10\n"); returns its length */
+int  profile_format_line(const struct rec_profile * p, char * buf, int len);
+
+/* "My 2.5K 2.35 10-bit": a name for settings saved from the camera (no keyboard there) */
+void profile_auto_name(const struct rec_profile * p, char * buf, int len);
+
+/* same Crop Mood settings (name ignored)? */
+int  profile_same_setup(const struct rec_profile * a, const struct rec_profile * b);
+
 #endif

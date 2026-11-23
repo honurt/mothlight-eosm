@@ -49,14 +49,42 @@ in the release notes.
 ### Quick bar (INFO, default)
 
 - [ ] INFO in movie mode opens the bar at the bottom; LiveView stays visible above it
-- [ ] SET moves between SHUTTER, APERTURE, ISO, WB, PROFILE; UP / DOWN change the value
+- [ ] SET moves between SHUTTER, APERTURE, ISO, WB, FOCUS, PROFILE, MENU; UP / DOWN change the value
 - [ ] The rear dial changes the shutter (Canon) and the bar follows at once
 - [ ] Tapping a tile selects it; tapping PROFILE again opens the list (check MOTHLOG.TXT "touch" lines)
 - [ ] Shutter shows its angle (green near 180); aperture shows the lens range
-- [ ] With Canon's Movie exposure on Auto, SHUTTER / APERTURE say "auto (Canon)" and the dial explains why
+- [ ] With Canon's Movie exposure on Auto, SHUTTER / APERTURE say "by Canon" and UP / DOWN explain why
 - [ ] A manual (adapted) lens: APERTURE says so
 - [ ] UP / DOWN on PROFILE open the profile list; INFO there goes back to the bar; REC starts RAW
 - [ ] No black flash on DOWN or SET
+- [ ] MENU tile: battery icon matches Canon's; "all good" or "N warnings"
+- [ ] Second time the bar opens: the most serious warning shows above it (if any)
+
+### Focus punch-in (FOCUS tile)
+
+- [ ] UP: x10 within about a second, the bar stays up; DOWN: back to where it was (x1 or x5)
+- [ ] INFO at x10: the bar closes and the zoom goes back
+- [ ] REC at x10: the zoom goes back first, then RAW records (not at x10)
+- [ ] Zoomed with Canon's own zoom first: closing the bar leaves that zoom alone
+
+### Settings (MENU tile, or Movie > Mothlight > Settings)
+
+- [ ] Opens full screen; UP / DOWN scroll; the help line explains the selected row
+- [ ] Theme: SET switches it right there; Animations, INFO button, Recording frame change
+- [ ] SD card speed: SET steps Off / 160 / 192 / 240 and says to restart; ML's Debug > SD Overclock agrees
+- [ ] Sound, Small hacks, Zebras, Focus peaking, False color match ML's own menu after changing
+- [ ] ML overlays Off: after closing, ML's overlays stay off (and On brings them back)
+- [ ] Warnings at the top (try Movie exposure Auto): the selection stays on its row when one goes away
+- [ ] Save Crop Mood's settings: set Crop Mood by hand in ML's menu, save, the profile appears as "My ..."
+      in the list and in ML/SETTINGS/PROFILES.TXT; saving again says "Already saved"
+- [ ] INFO goes back to the bar (or closes, if opened from ML's menu)
+
+### Welcome (first start after installing)
+
+- [ ] A few seconds after the first start in movie mode, the Welcome page opens by itself
+- [ ] Setup check: Crop Mood and RAW recording "Ready", SD speed and Movie exposure as set
+- [ ] "Start shooting" closes it and it does not come back after a restart
+- [ ] Settings > About > Welcome and setup check shows it again; INFO returns to Settings
 
 ### Applying
 

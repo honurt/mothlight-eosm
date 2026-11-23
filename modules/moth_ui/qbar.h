@@ -22,7 +22,7 @@
 #include "themes.h"
 #include "panel.h"          /* PK_* keys, PF_* flags, struct present */
 
-enum qb_item { QB_SHUTTER, QB_APERTURE, QB_ISO, QB_WB, QB_PROFILE, QB_COUNT };
+enum qb_item { QB_SHUTTER, QB_APERTURE, QB_ISO, QB_WB, QB_FOCUS, QB_PROFILE, QB_MENU, QB_COUNT };
 enum qb_tone { QT_DIM, QT_OK, QT_EDGE, QT_BURST, QT_ACCENT };
 
 struct qb_item_view
@@ -38,12 +38,16 @@ struct qbar_view
     const struct ui_theme * theme;
     int reduced_motion;
     struct qb_item_view item[QB_COUNT];
+    int battery_bars;       /* 0 low, 1 half, 2+ full; -1 unknown */
 };
+
+/* tile geometry: widths follow what each one shows (the profile name needs room) */
+extern const short qb_tile_x[QB_COUNT + 1];
 
 enum qbar_state { QB_CLOSED, QB_OPENING, QB_OPEN, QB_CLOSING };
 
 /* what a key asks the camera side to do */
-enum qbar_act { QA_NONE, QA_ADJUST, QA_OPEN_PANEL, QA_CLOSE, QA_LOCKED };
+enum qbar_act { QA_NONE, QA_ADJUST, QA_OPEN_PANEL, QA_CLOSE, QA_LOCKED, QA_OPEN_SETTINGS };
 
 struct qbar
 {
@@ -51,7 +55,7 @@ struct qbar
     int sel;
     int adj_item, adj_sign;         /* for QA_ADJUST / QA_LOCKED */
     struct tween reveal;            /* rows of the bar on screen, sliding up from the bottom */
-    struct tween hl;                /* highlight x */
+    struct tween hl, hl_w;          /* highlight x and width */
     uint32_t t_open, hint_until, toast_until;
     char toast[64];
     int toast_bad;

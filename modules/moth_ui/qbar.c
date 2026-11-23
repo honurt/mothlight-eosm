@@ -18,7 +18,6 @@
 
 #define SW       720
 #define SH       480
-#define TILE_W   (SW / QB_COUNT)
 
 #define TH       (v->theme ? v->theme : &moth_themes[THEME_MOTHLIGHT])
 #define C_LINE   (TH->line)
@@ -34,7 +33,11 @@
 #define T_HINT   3500
 #define T_TOAST  2600
 
-static const char * labels[QB_COUNT] = { "SHUTTER", "APERTURE", "ISO", "WB", "PROFILE" };
+static const char * labels[QB_COUNT] = { "SHUTTER", "APERTURE", "ISO", "WB", "FOCUS", "PROFILE", "MENU" };
+/*                                   SHUTTER APERT.  ISO   WB   FOCUS PROFILE MENU */
+const short qb_tile_x[QB_COUNT + 1] = { 0,   88,  174,  246,  330,  422,  610, 720 };
+#define TX(i) (qb_tile_x[i])
+#define TW(i) (qb_tile_x[(i) + 1] - qb_tile_x[i])
 
 static int dur(const struct qbar_view * v, int ms) { return v->reduced_motion ? 0 : ms; }
 
@@ -69,7 +72,8 @@ void qbar_open(struct qbar * q, const struct qbar_view * v, uint32_t now)
     q->prev_top = SH;
     q->full_redraw = 1;
     tween_start(&q->reveal, 0, SH - QB_Y, now, dur(v, T_OPEN), 0);
-    tween_start(&q->hl, sel * TILE_W, sel * TILE_W, now, 0, 0);
+    tween_start(&q->hl, TX(sel), TX(sel), now, 0, 0);
+    tween_start(&q->hl_w, TW(sel), TW(sel), now, 0, 0);
 }
 
 void qbar_close(struct qbar * q, const struct qbar_view * v, uint32_t now)
@@ -93,7 +97,8 @@ void qbar_changed(struct qbar * q) { q->dirty = 1; }
 static void select_tile(struct qbar * q, const struct qbar_view * v, int sel, uint32_t now)
 {
     sel = (sel % QB_COUNT + QB_COUNT) % QB_COUNT;
-    tween_retarget(&q->hl, tween_value(&q->hl, now), sel * TILE_W, now, dur(v, T_HL));
+    tween_retarget(&q->hl, tween_value(&q->hl, now), TX(sel), now, dur(v, T_HL));
+    tween_retarget(&q->hl_w, tween_value(&q->hl_w, now), TW(sel), now, dur(v, T_HL));
     q->sel = sel;
     q->dirty = 1;
 }
@@ -103,6 +108,7 @@ static int adjust(struct qbar * q, const struct qbar_view * v, int sign)
     q->adj_item = q->sel;
     q->adj_sign = sign;
     if (q->sel == QB_PROFILE) return QA_OPEN_PANEL;     /* "changing" the profile: the list */
+    if (q->sel == QB_MENU) return QA_OPEN_SETTINGS;
     return v->item[q->sel].locked ? QA_LOCKED : QA_ADJUST;
 }
 
@@ -127,10 +133,11 @@ int qbar_tap(struct qbar * q, const struct qbar_view * v, int x, int y, uint32_t
 {
     if (q->state != QB_OPEN) return QA_NONE;
     if (y < QB_Y || y >= SH || x < 0 || x >= SW) return QA_NONE;
-    int tile = x / TILE_W;
-    if (tile >= QB_COUNT) tile = QB_COUNT - 1;
+    int tile = 0;
+    while (tile < QB_COUNT - 1 && x >= TX(tile + 1)) tile++;
     if (tile != q->sel) { select_tile(q, v, tile, now); return QA_NONE; }
     if (tile == QB_PROFILE) return QA_OPEN_PANEL;
+    if (tile == QB_MENU) return QA_OPEN_SETTINGS;
     return QA_NONE;
 }
 
@@ -143,22 +150,32 @@ static void render_bar(struct qbar * q, const struct qbar_view * v, struct canva
     gfx_fill(c, 0, QB_Y, SW, 1, C_LINE);
     gfx_fill(c, 0, QB_Y + 1, SW, 2, C_ACCENT);
 
-    int hx = tween_value(&q->hl, now);
-    gfx_round(c, hx + 6, QB_Y + 8, TILE_W - 12, QB_H - 14, TH->hl_radius, C_HL);
-    gfx_fill(c, hx + 22, SH - 8, TILE_W - 44, 3, C_ACCENT);
+    int hx = tween_value(&q->hl, now), hw = tween_value(&q->hl_w, now);
+    gfx_round(c, hx + 5, QB_Y + 8, hw - 10, QB_H - 14, TH->hl_radius, C_HL);
+    gfx_fill(c, hx + 16, SH - 8, hw - 32, 3, C_ACCENT);
 
     for (int i = 0; i < QB_COUNT; i++)
     {
-        int x = i * TILE_W;
+        int x = TX(i), w = TW(i);
         if (i) gfx_fill(c, x, QB_Y + 16, 1, QB_H - 30, C_LINE);
-        int on_hl = hx > x - TILE_W / 2 && hx < x + TILE_W / 2;
+        int on_hl = hx > x - w / 2 && hx < x + w / 2;
         const struct qb_item_view * it = &v->item[i];
         uint8_t label_col = on_hl ? C_ACCENT : on_bar(v, C_DIM);
         uint8_t value_col = it->locked ? C_FAINT : on_hl ? TH->hl_text : on_bar(v, C_TEXT);
-        int tx = x + 16, tw = TILE_W - 26;
+        int tx = x + 12, tw = w - 20;
         ui_text_fit(c, UF_SMALL, tx, QB_Y + 9, label_col, UA_LEFT, labels[i], tw);
         ui_text_fit(c, UF_MED, tx, QB_Y + 22, value_col, UA_LEFT, it->value, tw);
         ui_text_fit(c, UF_SMALL, tx, QB_Y + 50, it->locked ? C_FAINT : tone(v, it->sub_tone), UA_LEFT, it->sub, tw);
+        if (i == QB_MENU && v->battery_bars >= 0)
+        {
+            /* battery, top-right of the last tile: 3 cells, red when low */
+            int bx = x + w - 34, by = QB_Y + 9;
+            uint8_t col = v->battery_bars == 0 ? TH->burst : on_bar(v, C_DIM);
+            int cells = v->battery_bars <= 0 ? 1 : v->battery_bars == 1 ? 2 : 3;
+            gfx_round_frame(c, bx, by, 22, 11, 2, col);
+            gfx_fill(c, bx + 22, by + 3, 2, 5, col);
+            for (int k = 0; k < cells; k++) gfx_fill(c, bx + 2 + k * 6, by + 2, 5, 7, col);
+        }
     }
     gfx_clip_all(c);
 }
@@ -225,7 +242,7 @@ int qbar_frame(struct qbar * q, const struct qbar_view * v, struct canvas * c, u
     }
 
     int bar_dirty = 0;
-    if (q->full_redraw || q->dirty || !tween_done(&q->hl, now))
+    if (q->full_redraw || q->dirty || !tween_done(&q->hl, now) || !tween_done(&q->hl_w, now))
     {
         render_bar(q, v, c, now);
         bar_dirty = 1;
@@ -258,7 +275,7 @@ int qbar_frame(struct qbar * q, const struct qbar_view * v, struct canvas * c, u
     if (q->state == QB_OPENING && tween_done(&q->reveal, now)) q->state = QB_OPEN;
 
     int flags = out->n ? PF_PRESENTED : 0;
-    if (q->state == QB_OPENING || !tween_done(&q->hl, now) || q->strip_shown)
+    if (q->state == QB_OPENING || !tween_done(&q->hl, now) || !tween_done(&q->hl_w, now) || q->strip_shown)
         flags |= PF_ANIMATING;      /* the strip expires on its own: keep frames coming */
     return flags;
 }

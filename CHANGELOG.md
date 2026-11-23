@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0 (24 Nov 2026)
+
+- **Settings page**, in Mothlight's look, from the quick bar's new MENU tile or Movie > Mothlight >
+  Settings. The things you actually change on an EOS M, in plain words with a help line each:
+  theme, animations, INFO button, recording frame; SD card speed (ML's overclock), the card speed
+  the verdicts assume, sound with RAW, small hacks; ML overlays, zebras, focus peaking, false
+  colour. ML's own menu stays one two-finger tap away for everything else.
+- **Focus punch-in**: a FOCUS tile on the bar zooms to x10 (UP) and back (DOWN). Closing the bar
+  zooms back; REC at x10 zooms back first, then records RAW.
+- **Battery and warnings**: the MENU tile shows the battery and counts what could spoil a take:
+  low battery, movie exposure on Auto, RAW off with a RAW profile, card almost full, SD overclock
+  off when the profile needs it, sound on at a risky rate, a BURST profile. The worst one shows
+  above the bar when it opens; all of them at the top of Settings.
+- **Save my profile**: Settings > Save Crop Mood's settings as a profile reads what Crop Mood is set
+  to and adds it to PROFILES.TXT as e.g. "My 2.5K 2.35 10-bit" (no duplicates, 16 at most).
+- **Welcome page** on the first start after installing: how the buttons work and a setup check
+  (Crop Mood, RAW recording, SD speed, movie exposure, sound). Again from Settings > About.
+- INSTALL.TXT in the download: three steps, and why the installer screen says "Magic Lantern
+  install" (ML-SETUP.FIR is ML's signed installer; Mothlight ships it untouched).
+- The bar's seven tiles have widths that fit what they show; aperture range written compactly.
+
 ## 0.2.1 (24 Nov 2026, from the camera's log)
 
 - The rear dial never reaches ML in LiveView: in manual movie exposure Canon uses it for the
