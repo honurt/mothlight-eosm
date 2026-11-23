@@ -2,10 +2,10 @@ Mothlight - Magic Lantern for the original Canon EOS M (firmware 2.0.2)
 by Onur  -  https://github.com/honurt/mothlight-eosm
 
 In movie mode:
-  INFO            the quick bar (shutter, aperture, ISO, WB, focus, profile, settings)
-  MENU tile       Mothlight settings; Settings > About > Welcome and setup check
-  PROFILE tile    recording profiles; Settings > Save Crop Mood's settings as a profile
-  Two-finger tap  Magic Lantern's full menu
+  INFO            the quick bar (shutter, aperture, ISO, WB, focus, profile)
+  Tap / half-press  focus there at x10 in Crop Mood presets, then back
+  PROFILE tile    recording profiles
+  Two-finger tap  the menu: the Mothlight tab comes first (Settings, Profiles, Theme ...)
 
 Loaded at start: crop_rec (Crop Mood), mlv_lite, mlv_snd, mlv_play, sd_uhs, moth_ui, file_man.
 Your own profiles live in ML/SETTINGS/PROFILES.TXT (see docs/PROFILES.md for the format).

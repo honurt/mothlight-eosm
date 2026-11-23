@@ -22,7 +22,7 @@
 #include "themes.h"
 #include "panel.h"          /* PK_* keys, PF_* flags, struct present */
 
-enum qb_item { QB_SHUTTER, QB_APERTURE, QB_ISO, QB_WB, QB_FOCUS, QB_PROFILE, QB_MENU, QB_COUNT };
+enum qb_item { QB_SHUTTER, QB_APERTURE, QB_ISO, QB_WB, QB_FOCUS, QB_PROFILE, QB_COUNT };
 enum qb_tone { QT_DIM, QT_OK, QT_EDGE, QT_BURST, QT_ACCENT };
 
 struct qb_item_view
@@ -47,7 +47,7 @@ extern const short qb_tile_x[QB_COUNT + 1];
 enum qbar_state { QB_CLOSED, QB_OPENING, QB_OPEN, QB_CLOSING };
 
 /* what a key asks the camera side to do */
-enum qbar_act { QA_NONE, QA_ADJUST, QA_OPEN_PANEL, QA_CLOSE, QA_LOCKED, QA_OPEN_SETTINGS };
+enum qbar_act { QA_NONE, QA_ADJUST, QA_OPEN_PANEL, QA_CLOSE, QA_LOCKED };
 
 struct qbar
 {
@@ -62,6 +62,7 @@ struct qbar
     int prev_top;                   /* topmost row shown last frame (SH = nothing) */
     int strip_shown;                /* the hint / toast strip above the bar is on screen */
     int full_redraw, dirty;
+    int bat_shown, bat_drawn;       /* the battery chip at the top-left: on screen, and with what */
 };
 
 void qbar_open(struct qbar * q, const struct qbar_view * v, uint32_t now);
@@ -74,7 +75,17 @@ void qbar_changed(struct qbar * q);         /* values changed: redraw the tiles 
 int  qbar_frame(struct qbar * q, const struct qbar_view * v, struct canvas * back,
                 uint32_t now, struct present * out);
 
+/* the battery, where Canon draws it on its own screen (top-left); its own small rectangle,
+   so LiveView and Canon's other icons around it are left alone. Ops use QB_BAT_X0..X1. */
+int  qbar_battery_frame(struct qbar * q, const struct qbar_view * v, struct canvas * back,
+                        uint32_t now, struct present * out);
+
 static inline int qbar_settled(const struct qbar * q) { return q->state == QB_OPEN; }
+
+#define QB_BAT_X0   8
+#define QB_BAT_X1   64
+#define QB_BAT_Y0   8
+#define QB_BAT_Y1   34
 
 /* geometry: a 72 px bar at the bottom, a 30 px strip above it for hints and messages */
 #define QB_H        72

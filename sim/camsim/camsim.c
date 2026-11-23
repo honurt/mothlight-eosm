@@ -65,6 +65,7 @@ static const char * dump_dir;
 static int dump_n;
 static int global_draw_at_start = 1;
 static int soak_settings_frames, soak_x10_frames;
+static int crop_wants_hidden(void);
 static int begin_pending;                  /* overlay_begin() is between its first call and overlay_active = 1 */
 
 /* menus: (menu, entry) -> value; missing entries model unloaded modules */
@@ -85,6 +86,7 @@ static struct mval menus[] = {
     { "Debug", "SD Overclock", 2, 1 },
     { "RAW video", "Sound recording", 0, 1 },
     { "RAW video", "Small hacks", 1, 1 },
+    { "RAW video", "Preview", 1, 1 },
     { "Overlay", "Zebras", 0, 1 },
     { "Overlay", "Focus Peak", 0, 1 },
     { "Overlay", "False color", 0, 1 },
@@ -290,9 +292,13 @@ static void canon_redraw_screen(void)
     if (overlay_active) canon_redraws_open++;
 }
 
+static int canon_af_in_x5, canon_moved_window;   /* what Crop Mood users suffer without Mothlight */
+static int crop_mood_x5_idle(void);
 static void canon_receive(int code)
 {
     canon_got[code & 0xff]++;
+    if (code == 0x50 && crop_mood_x5_idle() && !cam.manual_focus && cam.lens.lens_exists) canon_af_in_x5++;
+    if (code == 0x70 && crop_mood_x5_idle()) canon_moved_window++;
     /* housekeeping: card door, power checks, "info changed", "press button something" (0x54
        follows every press on the real camera, and UP stayed smooth there) -- no redraw */
     if (code == 93 || code == 91 || code == 97 || code == 105 || code == 0x54) return;
@@ -325,14 +331,14 @@ static const struct keymap_entry eosm_keys[] = {
     { 0x0D, MODULE_KEY_TRASH }, { 0x1E, MODULE_KEY_REC },
     { 0x2a, MODULE_KEY_PRESS_UP }, { 0x26, MODULE_KEY_PRESS_RIGHT },
     { 0x28, MODULE_KEY_PRESS_LEFT }, { 0x2c, MODULE_KEY_PRESS_DOWN },
-    { 0x50, MODULE_KEY_PRESS_HALFSHUTTER },
+    { 0x50, MODULE_KEY_PRESS_HALFSHUTTER }, { 0x51, MODULE_KEY_UNPRESS_HALFSHUTTER },
     { 0x6f, MODULE_KEY_TOUCH_1_FINGER }, { 0x70, MODULE_KEY_UNTOUCH_1_FINGER },
     { 0x76, MODULE_KEY_TOUCH_2_FINGER }, { 0x77, MODULE_KEY_UNTOUCH_2_FINGER },
 };
 enum {
     K_WL = 0x02, K_WR = 0x03, K_SET = 0x04, K_SET_UP = 0x05, K_MENU = 0x06, K_INFO = 0x07,
     K_PLAY = 0x0B, K_REC = 0x1E, K_UP = 0x2a, K_UP_UP = 0x2b, K_RIGHT = 0x26, K_RIGHT_UP = 0x27,
-    K_LEFT = 0x28, K_LEFT_UP = 0x29, K_DOWN = 0x2c, K_DOWN_UP = 0x2d, K_HALF = 0x50,
+    K_LEFT = 0x28, K_LEFT_UP = 0x29, K_DOWN = 0x2c, K_DOWN_UP = 0x2d, K_HALF = 0x50, K_HALF_UP = 0x51,
     K_TOUCH = 0x6f, K_UNTOUCH = 0x70, K_TOUCH2 = 0x76, K_DOOR = 93, K_OLC = 105, K_UNHANDLED = 0x54,
     K_QSET = 0x1d,
 };
@@ -454,6 +460,7 @@ static void tap(int canon, int hold_ms)
         case K_RIGHT: gui_event(K_RIGHT_UP); break;
         case K_SET: gui_event(K_SET_UP); break;
         case K_TOUCH: gui_event(K_UNTOUCH); break;
+        case K_HALF: gui_event(K_HALF_UP); break;
     }
 }
 
@@ -504,6 +511,13 @@ static void world_tick(void)
             { raw_w = p->nominal.width; raw_h = p->nominal.height; break; }
         }
     }
+    /* crop_rec's own task, ~10 Hz: hides Canon's layer in x5 (with a clrscr) */
+    static uint32_t last_crop_check;
+    if (now_ms - last_crop_check >= 100)
+    {
+        last_crop_check = now_ms;
+        if (crop_wants_hidden() && cam.front_enabled) { cam.front_enabled = 0; memset(bmp, 0, BMPPITCH * 480); }
+    }
     if (canon_periodic_ms && cam.lv_on && now_ms - last_periodic >= (uint32_t)canon_periodic_ms)
     {
         last_periodic = now_ms;
@@ -526,6 +540,34 @@ int gui_menu_shown(void) { return cam.menu_shown; }
 int display_is_on(void) { return cam.display_on; }
 void set_lv_zoom(int z) { cam.dispsize = z; lv_refresh(); cam_block(stall_zoom_ms ? stall_zoom_ms : 600); }
 int fps_get_current_x1000(void) { return 23976; }
+
+/* Canon's AF point, in its own coordinates (the whole sensor) */
+#define AF_W 5184
+#define AF_H 3456
+static int af_cx = AF_W / 2, af_cy = AF_H / 2, af_moves, af_moves_rec;
+static int sw1_on, af_runs, af_at_x10, af_at_x5;
+static uint32_t sw1_since;
+static int af_never_confirms;
+static int crop_mood_x5_idle(void) { return menu_val("Movie", "Crop mood") > 0 && cam.dispsize == 5 && !cam.recording && cam.lv_on; }
+void get_afframe_sensor_res(int * W, int * H) { if (W) *W = AF_W; if (H) *H = AF_H; }
+void get_afframe_pos(int W, int H, int * x, int * y) { *x = af_cx * W / AF_W; *y = af_cy * H / AF_H; }
+void move_lv_afframe(int dx, int dy)
+{
+    if (cam.recording) af_moves_rec++;
+    af_cx = af_cx + dx; af_cy = af_cy + dy;
+    af_cx = af_cx < 200 ? 200 : af_cx > AF_W - 200 ? AF_W - 200 : af_cx;
+    af_cy = af_cy < 150 ? 150 : af_cy > AF_H - 150 ? AF_H - 150 : af_cy;
+    af_moves++;
+    cam_block(40);
+}
+void SW1(int v, int wait)
+{
+    if (v && !sw1_on) { sw1_since = now_ms; af_runs++; if (cam.dispsize == 10) af_at_x10++; else af_at_x5++; }
+    sw1_on = v;
+    cam_block(wait);
+}
+int is_manual_focus(void) { return cam.manual_focus; }
+int get_focus_confirmation(void) { return sw1_on && !af_never_confirms && now_ms - sw1_since > 400; }
 void gui_stop_menu(void) { cam.menu_shown = 0; }
 
 int menu_get_value_from_script(const char * m, const char * e)
@@ -551,8 +593,21 @@ const char * menu_get_str_value_from_script(const char * m, const char * e, stru
 }
 
 uint8_t * bmp_vram_real(void) { return bmp; }
+/* Crop Mood keeps Canon's overlay layer off in its x5 modes (crop_rec.c: "disable Canon
+   overlays in x5 mode for cleaner preview"); turning it on there makes Canon's icons flash
+   up until crop_rec hides them again */
+static int canon_layer_flashes;
+static int crop_wants_hidden(void)
+{
+    return menu_val("Movie", "Crop mood") > 0 && cam.dispsize == 5 && !cam.recording && cam.lv_on;
+}
+int canon_gui_front_buffer_disabled(void) { return !cam.front_enabled; }
 void canon_gui_disable_front_buffer(void) { cam.front_enabled = 0; begin_pending = 1; }
-void canon_gui_enable_front_buffer(int x) { cam.front_enabled = 1; }
+void canon_gui_enable_front_buffer(int x)
+{
+    if (crop_wants_hidden() && !cam.front_enabled) canon_layer_flashes++;
+    cam.front_enabled = 1;
+}
 void clrscr(void) { memset(bmp, 0, BMPPITCH * 480); }
 uint32_t get_ms_clock(void) { return now_ms; }
 void redraw(void) { if (cam.lv_on && !cam.playback) canon_redraw_screen(); }
@@ -682,6 +737,7 @@ void fio_free(void * p) { cam_free(p); }
 int is_camera(const char * m, const char * fw) { return !strcmp(m, "EOSM") && !strcmp(fw, "2.0.2"); }
 
 static struct menu_entry * menu_root;
+static struct menu_entry * menu_child(const char * name);
 static int menu_n;
 void menu_add(const char * parent, struct menu_entry * e, int n) { menu_root = e; menu_n = n; }
 static struct lvinfo_item * lv_items;
@@ -715,12 +771,15 @@ static void post_frame_checks(void)
     /* what Global Draw must be once closed: as it was, or as Settings > ML overlays chose */
     if (overlay_active && saved_global_draw >= 0) global_draw_at_start = saved_global_draw;
     if (overlay_active) { if (ov_mode == OV_SETTINGS) soak_settings_frames++; if (cam.dispsize == 10) soak_x10_frames++; }
-    if (!overlay_active && !begin_pending && gui_state == MOTH_GUI_STATE)
+    if (!overlay_active && !begin_pending && fj_state == FJ_IDLE && gui_state == MOTH_GUI_STATE)
         FAIL("ML's gui_state left at Mothlight's value with the panel closed");
     if (was_overlay && !overlay_active && !begin_pending)
     {
         /* the panel just handed the screen back */
-        EXPECT(cam.front_enabled, "Canon's front buffer was left disabled");
+        EXPECT(!cam.lv_on || cam.recording || cam.front_enabled == !crop_wants_hidden(), "Canon's layer left %s (Crop Mood x5 wants it %s)",
+               cam.front_enabled ? "on" : "off", crop_wants_hidden() ? "off" : "on");
+        EXPECT(canon_layer_flashes == 0, "Canon's overlay layer turned on in Crop Mood x5 (%d times): its icons flash up",
+               canon_layer_flashes);
         EXPECT(back_buf == 0, "panel buffer (338 KB) not freed after close");
         EXPECT(menu_val("Overlay", "Global Draw") == global_draw_at_start,
                "Global Draw left at %d (was %d)", menu_val("Overlay", "Global Draw"), global_draw_at_start);
@@ -989,8 +1048,19 @@ static void s_qbar_basic(void)
     /* LiveView above the bar stays untouched (transparent) */
     int dirty_above = 0;
     for (int y = 0; y < QB_STRIP_Y && !dirty_above; y += 3)
-        for (int x = 0; x < UI_W; x += 7) if (bmp[y * BMPPITCH + x]) { dirty_above = 1; break; }
+        for (int x = 0; x < UI_W; x += 7)
+        {
+            if (x >= QB_BAT_X0 && x < QB_BAT_X1 && y >= QB_BAT_Y0 && y < QB_BAT_Y1) continue;   /* the battery */
+            if (bmp[y * BMPPITCH + x]) { dirty_above = 1; break; }
+        }
     EXPECT(!dirty_above, "the bar drew above its area (LiveView should show there)");
+    int chip = 0;
+    for (int y = QB_BAT_Y0; y < QB_BAT_Y1; y++) for (int x = QB_BAT_X0; x < QB_BAT_X1; x++) chip += bmp[y * BMPPITCH + x] != 0;
+    EXPECT(chip > 300, "no battery at the top-left (%d pixels)", chip);
+    /* low battery: the chip follows within a refresh, and goes away with the bar */
+    cam.battery = 0; run_for(300);
+    EXPECT(qbar.bat_drawn == 0, "battery chip did not follow the battery level");
+    cam.battery = 2; run_for(300);
 
     bar_select(QB_SHUTTER);
     tap(K_UP, 30); run_for(200);
@@ -1011,6 +1081,9 @@ static void s_qbar_basic(void)
     printf("    worst overdraw with the bar: %d ms\n", worst_overdraw);
     tap(K_INFO, 0); run_for(400);
     EXPECT(!overlay_active && gui_state == 0, "INFO did not close the bar cleanly");
+    chip = 0;   /* (0x01 is Canon's own overlay, redrawn after closing) */
+    for (int y = QB_BAT_Y0; y < QB_BAT_Y1; y++) for (int x = QB_BAT_X0; x < QB_BAT_X1; x++) chip += bmp[y * BMPPITCH + x] > 1;
+    EXPECT(chip == 0, "battery chip left on screen after closing (%d pixels)", chip);
     finish();
 }
 
@@ -1375,9 +1448,9 @@ static void s_stale_keys_on_menu_open(void)
     EXPECT(!overlay_active, "did not close");
     /* now open from the ML menu (does not go through the INFO path) */
     cam.menu_shown = 1;
-    menu_root->select(0, 1);
+    menu_child("Profiles")->select(0, 1);
     run_for(1200);
-    EXPECT(panel_open_now(), "Mothlight > Open profiles did not open the panel");
+    EXPECT(panel_open_now(), "Mothlight > Profiles did not open the panel");
     EXPECT(menu_val("Movie", "Crop mood") == 0, "stale SET from the last session applied a profile");
     finish();
 }
@@ -1496,7 +1569,7 @@ static void s_parser_fuzz(void)
 
 static void s_bad_config_at_boot(void)
 {
-    cfg_theme = 99; cfg_active = 40; cfg_card = 77; cfg_tally = 9; cfg_bpp10 = -5;
+    cfg_theme = 99; cfg_active = 40; cfg_card = 77; cfg_tally = 9; cfg_bpp10 = -5; cfg_focus = 7; cfg_key = -3; cfg_motion = 4;
     boot();
     open_panel();
     tap(K_DOWN, 30); run_for(300);
@@ -1508,6 +1581,8 @@ static void s_bad_config_at_boot(void)
         for (struct menu_entry * c = e->children; c && c->name; c++) if (c->update) c->update(c, &info);
     }
     lv_items[0].update(&lv_items[0], 1);
+    EXPECT(cfg_theme < THEME_COUNT && cfg_card < 10 && cfg_tally <= 2 && cfg_focus <= 1 && cfg_key >= 0 && cfg_key <= 2 && cfg_motion <= 1,
+           "corrupt settings not repaired at start");
     finish();
 }
 
@@ -1559,9 +1634,10 @@ static void s_soak(void)
     static const int keys[] = { K_UP, K_DOWN, K_LEFT, K_RIGHT, K_WL, K_WR, K_SET, K_INFO, K_INFO, K_INFO,
                                 K_HALF, K_TOUCH, K_UNHANDLED, K_OLC, K_DOOR, K_REC, K_MENU, K_PLAY,
                                 K_SET, K_UP, K_UP, K_TOUCH2 };
-    int opens = 0;
+    int opens = 0, focus_steps = 0;
     for (int step = 0; step < 4000; step++)
     {
+        if (getenv("SOAKDBG")) fprintf(stderr, "step %d t %u ov %d mode %d fj %d zoom %d lv %d rec %d menu %d gs %d\n", step, now_ms, overlay_active, ov_mode, fj_state, cam.dispsize, cam.lv_on, cam.recording, cam.menu_shown, gui_state);
         int r = rand() % 100;
         if (r < 70) tap(keys[rand() % COUNT(keys)], rand() % 60);
         else if (r < 74) { cam.movie = !cam.movie; }
@@ -1580,22 +1656,25 @@ static void s_soak(void)
                            gui_event(K_TOUCH); run_for(rand() % 80); gui_event(K_UNTOUCH); }
         run_for(rand() % 150);
         if (overlay_active) opens++;
+        if (fj_state != FJ_IDLE) focus_steps++;
         /* keep the world able to show the panel most of the time */
         if (rand() % 10 == 0) { cam.movie = 1; cam.playback = 0; cam.lv_on = 1; cam.recording = 0; cam.menu_shown = 0; }
     }
     stall_zoom_ms = 0; canon_periodic_ms = 0; cfg_key = 2;
     cam.movie = 1; cam.playback = 0; cam.lv_on = 1; cam.recording = 0; cam.menu_shown = 0; cam.display_on = 1;
     run_for(7000);
+    cam.recording = 0;                      /* a REC pressed during a focus job records once it is back */
     if (overlay_active) close_panel();
     run_for(1000);
-    EXPECT(!overlay_active && cam.front_enabled, "soak: did not end closed and clean");
+    EXPECT(!overlay_active && cam.front_enabled == !crop_wants_hidden(), "soak: did not end closed and clean (overlay %d, front %d, zoom %d, focus job %d, mood %d, menu %d, rec %d, lv %d, play %d)",
+           overlay_active, cam.front_enabled, cam.dispsize, fj_state, menu_val("Movie", "Crop mood"), cam.menu_shown, cam.recording, cam.lv_on, cam.playback);
     EXPECT(heap_live == 0, "soak: %ld bytes leaked", heap_live);
     EXPECT(menu_val("Overlay", "Global Draw") == global_draw_at_start, "soak: Global Draw left at %d (chosen %d)",
            menu_val("Overlay", "Global Draw"), global_draw_at_start);
     EXPECT(cam.dispsize != 10 || zoom_before == 0, "soak: left punched in at x10");
-    EXPECT(opens > 100, "soak: panel was barely open (%d steps), test not meaningful", opens);
-    printf("    soak seed %u: %d steps open (%d frames on Settings, %d at x10), %d frames checked, %u s simulated\n",
-           seed, opens, soak_settings_frames, soak_x10_frames, frames_checked, now_ms / 1000);
+    EXPECT(opens + focus_steps > 100, "soak: panel barely open (%d steps) and no focus jobs (%d), test not meaningful", opens, focus_steps);
+    printf("    soak seed %u: %d steps open, %d in focus jobs (%d frames on Settings, %d at x10), %d frames checked, %u s simulated\n",
+           seed, opens, focus_steps, soak_settings_frames, soak_x10_frames, frames_checked, now_ms / 1000);
     open_panel();                           /* and it still works */
     finish();
 }
@@ -1654,12 +1733,14 @@ static void s_text_fits(void)
 
 /* ---------------------------------------------------------------- settings page */
 
+static struct menu_entry * menu_child(const char * name);
 static void open_settings(void)
 {
-    open_bar();
-    bar_select(QB_MENU);
-    tap(K_UP, 30); run_for(500);
-    EXPECT(overlay_active && ov_mode == OV_SETTINGS, "UP on MENU did not open Settings (mode %d)", ov_mode);
+    cam.menu_shown = 1;
+    struct menu_entry * e = menu_child("Settings");
+    if (e) e->select(0, 1);
+    run_for(1200);
+    EXPECT(overlay_active && ov_mode == OV_SETTINGS, "Mothlight > Settings did not open the page (mode %d)", ov_mode);
 }
 
 static int sel_id(void) { return sets.sel >= 0 && sets.sel < sview.count ? sview.row[sets.sel].id : -1; }
@@ -1674,8 +1755,7 @@ static void settings_set(int id) { settings_goto(id); tap(K_SET, 30); run_for(25
 
 static struct menu_entry * menu_child(const char * name)
 {
-    for (struct menu_entry * c = menu_root->children; c && c->name; c++)
-        if (!strcmp(c->name, name)) return c;
+    for (int i = 0; i < menu_n; i++) if (!strcmp(menu_root[i].name, name)) return &menu_root[i];
     return 0;
 }
 
@@ -1701,11 +1781,9 @@ static void s_settings_basic(void)
     settings_set(SI_MOTION);
     EXPECT(cfg_motion == 0, "Animations not switched off");
     settings_set(SI_MOTION);
-    /* INFO: back to the bar, INFO again: closed */
-    tap(K_INFO, 0); run_for(500);
-    EXPECT(overlay_active && ov_mode == OV_BAR && qbar.state == QB_OPEN, "INFO on Settings did not go back to the bar (mode %d)", ov_mode);
+    /* INFO: closed (opened from ML's menu) */
     tap(K_INFO, 0); run_for(600);
-    EXPECT(!overlay_active && gui_state == 0, "bar did not close after Settings");
+    EXPECT(!overlay_active && gui_state == 0, "INFO did not close Settings");
     finish();
 }
 
@@ -1722,6 +1800,8 @@ static void s_settings_ml_items(void)
     settings_set(SI_SOUND);
     EXPECT(menu_val("RAW video", "Sound recording") == 1, "Sound not switched on");
     settings_set(SI_SOUND);
+    settings_set(SI_PREVIEW);
+    EXPECT(menu_val("RAW video", "Preview") == 2 && screen_says("ML framing"), "preview setting: %d", menu_val("RAW video", "Preview"));
     settings_set(SI_HACKS);
     EXPECT(menu_val("RAW video", "Small hacks") == 2, "Small hacks: %d", menu_val("RAW video", "Small hacks"));
     settings_set(SI_ZEBRAS);
@@ -1808,8 +1888,8 @@ static void s_warnings(void)
     open_bar(); close_panel();
     open_bar();                             /* second time: the worst warning in the strip */
     EXPECT(screen_says("Battery low"), "low battery not in the bar's strip:\n%s", ui_text_drawn);
-    EXPECT(screen_says("warnings"), "MENU tile does not count the warnings");
-    bar_select(QB_MENU); tap(K_UP, 30); run_for(500);
+    close_panel();
+    open_settings();
     EXPECT(screen_says("Battery low") && screen_says("Movie exposure is Auto") && screen_says("SD Overclock is off"),
            "warnings missing on the settings page:\n%s", ui_text_drawn);
     int w0 = sview.warn_count;
@@ -1928,9 +2008,11 @@ static void s_welcome(void)
     boot();
     run_for(4000);
     EXPECT(overlay_active && ov_mode == OV_SETTINGS && welcome_mode, "no welcome on the first start (overlay %d mode %d)", overlay_active, ov_mode);
-    EXPECT(screen_says("Welcome") && screen_says("is installed") && screen_says("SETUP CHECK") && screen_says("Ready"),
+    EXPECT(screen_says("Welcome") && screen_says("is installed") && screen_says("SETUP CHECK"),
            "welcome not drawn:\n%s", ui_text_drawn);
     EXPECT(sel_id() == SI_WELCOME_DONE, "welcome does not start on 'Start shooting'");
+    settings_goto(SI_CHECK_RAW);
+    EXPECT(screen_says("Ready"), "setup check not drawn:\n%s", ui_text_drawn);
     ui_text_overflows = 0;
     for (int i = 0; i < 12; i++) { tap(K_DOWN, 30); run_for(80); }
     EXPECT(ui_text_overflows == 0, "%d strings overflowed on the welcome page (last: %s)", ui_text_overflows, ui_text_overflow_last);
@@ -1965,6 +2047,114 @@ static void s_welcome_waits(void)
     tap(K_REC, 0); run_for(300);         /* REC closes it like any page, and counts as seen */
     EXPECT(!overlay_active && cfg_welcomed, "REC did not close the welcome (or it was not marked seen)");
     cam.recording = 0; run_for(3500);
+    finish();
+}
+
+/* ---------------------------------------------------------------- focus at x10 */
+
+static void crop_preset_on(void)
+{
+    open_panel(); select_profile(find_profile(MOOD_1X1)); tap(K_SET, 40); run_for(4000);
+    if (overlay_active) close_panel();
+    run_for(300);
+    EXPECT(cam.dispsize == 5 && menu_val("Movie", "Crop mood") > 0, "no Crop Mood x5 preset (zoom %d)", cam.dispsize);
+}
+
+static void s_focus_half_press(void)
+{
+    boot(); crop_preset_on();
+    gui_event(K_HALF); run_for(1600);
+    EXPECT(cam.dispsize == 10 && fj_state == FJ_HOLD, "half-press did not go to x10 (zoom %d, job %d)", cam.dispsize, fj_state);
+    EXPECT(af_at_x10 == 1 && af_at_x5 == 0 && canon_af_in_x5 == 0, "AF ran %d at x10, %d at x5, Canon %d at x5", af_at_x10, af_at_x5, canon_af_in_x5);
+    EXPECT(cam.front_enabled, "Canon's layer (its focus box) not shown at x10");
+    EXPECT(fj_focused, "focus not confirmed");
+    run_for(1500);
+    EXPECT(cam.dispsize == 10, "x10 left while the half-press is still held");
+    gui_event(K_HALF_UP); run_for(2500);
+    EXPECT(cam.dispsize == 5 && fj_state == FJ_IDLE, "release did not go back to x5 (zoom %d, job %d)", cam.dispsize, fj_state);
+    EXPECT(af_cx == AF_W / 2 && af_cy == AF_H / 2, "AF point not centred again (%d,%d)", af_cx, af_cy);
+    EXPECT(!cam.front_enabled && canon_layer_flashes == 0, "Canon's layer after going back: on %d, flashes %d", cam.front_enabled, canon_layer_flashes);
+    EXPECT(!sw1_on, "half-shutter switch left pressed");
+    finish();
+}
+
+static void s_focus_tap(void)
+{
+    boot(); crop_preset_on();
+    touch_raw = 0xffffffff;
+    touch_at(600, 140);                     /* top-right of the picture */
+    run_for(900);
+    EXPECT(cam.dispsize == 10 && af_cx > AF_W / 2 + 300 && af_cy < AF_H / 2, "tap: zoom %d, AF point %d,%d", cam.dispsize, af_cx, af_cy);
+    EXPECT(canon_moved_window == 0, "the tap reached Canon (it would move the recorded window)");
+    run_for(3500);
+    EXPECT(cam.dispsize == 5 && fj_state == FJ_IDLE && af_cx == AF_W / 2 && af_cy == AF_H / 2,
+           "after the tap: zoom %d, job %d, AF %d,%d", cam.dispsize, fj_state, af_cx, af_cy);
+    /* a second tap while looking: done at once */
+    touch_at(100, 300); run_for(1200);
+    EXPECT(fj_state == FJ_HOLD, "second focus job not holding (%d)", fj_state);
+    touch_at(360, 240); run_for(2200);
+    EXPECT(fj_state == FJ_IDLE && cam.dispsize == 5, "a tap while looking did not end it");
+    /* the focus never confirms: still comes back */
+    af_never_confirms = 1;
+    touch_at(360, 240); run_for(6000);
+    EXPECT(fj_state == FJ_IDLE && cam.dispsize == 5 && !sw1_on, "no-focus job stuck (job %d zoom %d sw1 %d)", fj_state, cam.dispsize, sw1_on);
+    finish();
+}
+
+static void s_focus_leaves_alone(void)
+{
+    boot();
+    /* not a Crop Mood preset: Canon's own tap AF and half-press */
+    int t0 = canon_got[K_UNTOUCH], h0 = canon_got[K_HALF];
+    touch_at(500, 200); tap(K_HALF, 200); run_for(300);
+    EXPECT(canon_got[K_UNTOUCH] == t0 + 1 && canon_got[K_HALF] == h0 + 1 && fj_state == FJ_IDLE, "x1: tap / half-press not Canon's");
+    crop_preset_on();
+    /* manual focus: Crop Mood's own x10 key, not Mothlight */
+    cam.manual_focus = 1;
+    h0 = canon_got[K_HALF];
+    tap(K_HALF, 200); run_for(300);
+    EXPECT(canon_got[K_HALF] == h0 + 1 && fj_state == FJ_IDLE, "MF: half-press taken");
+    cam.manual_focus = 0;
+    /* switched off in Settings */
+    cfg_focus = 0;
+    h0 = canon_got[K_HALF];
+    tap(K_HALF, 200); run_for(300);
+    EXPECT(canon_got[K_HALF] == h0 + 1 && fj_state == FJ_IDLE, "focus off: half-press taken");
+    cfg_focus = 1;
+    /* while recording: never (Crop Mood blocks taps itself) */
+    menu_set_value_from_script("Movie", "RAW video", 1);
+    tap(K_REC, 0); run_for(200);
+    EXPECT(cam.recording, "not recording");
+    touch_at(500, 200); tap(K_HALF, 200); run_for(1500);
+    EXPECT(fj_state == FJ_IDLE && af_moves_rec == 0 && cam.dispsize == 5, "focus job while recording");
+    cam.recording = 0; run_for(3500);
+    finish();
+}
+
+static void s_focus_keys_meanwhile(void)
+{
+    boot(); crop_preset_on();
+    menu_set_value_from_script("Movie", "RAW video", 1);
+    /* REC while looking at x10: back to x5 first, then RAW */
+    touch_at(360, 240); run_for(1000);
+    EXPECT(cam.dispsize == 10, "no x10");
+    tap(K_REC, 0); run_for(3500);
+    EXPECT(raw_recordings == 1 && rec_at_x10 == 0 && cam.dispsize == 5, "REC during focus: %d RAW, %d at x10, zoom %d",
+           raw_recordings, rec_at_x10, cam.dispsize);
+    cam.recording = 0; run_for(3500);
+    /* INFO while looking: ends it; the bar does not pop up over x10 */
+    cfg_key = 1;
+    touch_at(360, 240); run_for(1000);
+    tap(K_INFO, 0); run_for(2500);
+    EXPECT(fj_state == FJ_IDLE && cam.dispsize == 5 && !overlay_active, "INFO during focus: job %d zoom %d overlay %d", fj_state, cam.dispsize, overlay_active);
+    open_bar(); close_panel();
+    /* two-finger tap (ML's menu) while holding a half-press, and the release is lost */
+    gui_event(K_HALF); run_for(1200);
+    tap(K_TOUCH2, 0); run_for(200);
+    EXPECT(cam.menu_shown, "ML's menu did not open");
+    run_for(2500);
+    cam.menu_shown = 0; run_for(2000);
+    EXPECT(fj_state == FJ_IDLE && cam.dispsize == 5, "lost release left x10 (job %d zoom %d)", fj_state, cam.dispsize);
     finish();
 }
 
@@ -2027,6 +2217,10 @@ static const struct sc all[] = {
     { "focus punch-in: x10, back, close, close mid-zoom, REC at x10", s_focus_punch_in },
     { "welcome on the first start, and again from Settings", s_welcome },
     { "welcome waits for calm movie LiveView", s_welcome_waits },
+    { "focus: half-press focuses at x10, release goes back to x5", s_focus_half_press },
+    { "focus: a tap focuses there at x10; second tap; no confirmation", s_focus_tap },
+    { "focus: x1, manual focus, switched off, recording are left to Canon / Crop Mood", s_focus_leaves_alone },
+    { "focus: REC, INFO, ML's menu during a focus job", s_focus_keys_meanwhile },
     { "soak: 4000 random steps of keys and camera events", s_soak },
 };
 

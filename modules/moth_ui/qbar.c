@@ -33,9 +33,9 @@
 #define T_HINT   3500
 #define T_TOAST  2600
 
-static const char * labels[QB_COUNT] = { "SHUTTER", "APERTURE", "ISO", "WB", "FOCUS", "PROFILE", "MENU" };
-/*                                   SHUTTER APERT.  ISO   WB   FOCUS PROFILE MENU */
-const short qb_tile_x[QB_COUNT + 1] = { 0,   88,  174,  246,  330,  422,  610, 720 };
+static const char * labels[QB_COUNT] = { "SHUTTER", "APERTURE", "ISO", "WB", "FOCUS", "PROFILE" };
+/*                                   SHUTTER APERT.  ISO   WB   FOCUS PROFILE */
+const short qb_tile_x[QB_COUNT + 1] = { 0,  104,  204,  292,  392,  484,  720 };
 #define TX(i) (qb_tile_x[i])
 #define TW(i) (qb_tile_x[(i) + 1] - qb_tile_x[i])
 
@@ -108,7 +108,6 @@ static int adjust(struct qbar * q, const struct qbar_view * v, int sign)
     q->adj_item = q->sel;
     q->adj_sign = sign;
     if (q->sel == QB_PROFILE) return QA_OPEN_PANEL;     /* "changing" the profile: the list */
-    if (q->sel == QB_MENU) return QA_OPEN_SETTINGS;
     return v->item[q->sel].locked ? QA_LOCKED : QA_ADJUST;
 }
 
@@ -137,7 +136,6 @@ int qbar_tap(struct qbar * q, const struct qbar_view * v, int x, int y, uint32_t
     while (tile < QB_COUNT - 1 && x >= TX(tile + 1)) tile++;
     if (tile != q->sel) { select_tile(q, v, tile, now); return QA_NONE; }
     if (tile == QB_PROFILE) return QA_OPEN_PANEL;
-    if (tile == QB_MENU) return QA_OPEN_SETTINGS;
     return QA_NONE;
 }
 
@@ -166,18 +164,66 @@ static void render_bar(struct qbar * q, const struct qbar_view * v, struct canva
         ui_text_fit(c, UF_SMALL, tx, QB_Y + 9, label_col, UA_LEFT, labels[i], tw);
         ui_text_fit(c, UF_MED, tx, QB_Y + 22, value_col, UA_LEFT, it->value, tw);
         ui_text_fit(c, UF_SMALL, tx, QB_Y + 50, it->locked ? C_FAINT : tone(v, it->sub_tone), UA_LEFT, it->sub, tw);
-        if (i == QB_MENU && v->battery_bars >= 0)
-        {
-            /* battery, top-right of the last tile: 3 cells, red when low */
-            int bx = x + w - 34, by = QB_Y + 9;
-            uint8_t col = v->battery_bars == 0 ? TH->burst : on_bar(v, C_DIM);
-            int cells = v->battery_bars <= 0 ? 1 : v->battery_bars == 1 ? 2 : 3;
-            gfx_round_frame(c, bx, by, 22, 11, 2, col);
-            gfx_fill(c, bx + 22, by + 3, 2, 5, col);
-            for (int k = 0; k < cells; k++) gfx_fill(c, bx + 2 + k * 6, by + 2, 5, 7, col);
-        }
     }
     gfx_clip_all(c);
+}
+
+static void add_op(struct present * out, int y0, int y1, int clear)
+{
+    if (y1 <= y0) return;
+    /* merge with the previous op when they touch and are of the same kind */
+    if (out->n && out->op[out->n - 1].clear == clear && y0 <= out->op[out->n - 1].y1)
+    {
+        if (y1 > out->op[out->n - 1].y1) out->op[out->n - 1].y1 = (short)y1;
+        return;
+    }
+    if (out->n >= (int)(sizeof(out->op) / sizeof(out->op[0]))) return;
+    out->op[out->n].y0 = (short)y0;
+    out->op[out->n].y1 = (short)y1;
+    out->op[out->n].clear = (char)clear;
+    out->n++;
+}
+
+/* ---------------------------------------------------------------- the battery chip */
+
+static void render_battery(const struct qbar_view * v, struct canvas * c)
+{
+    gfx_clip(c, QB_BAT_X0, QB_BAT_Y0, QB_BAT_X1, QB_BAT_Y1);
+    gfx_fill(c, QB_BAT_X0, QB_BAT_Y0, QB_BAT_X1 - QB_BAT_X0, QB_BAT_Y1 - QB_BAT_Y0, 0);
+    int low = v->battery_bars == 0;
+    gfx_round(c, QB_BAT_X0, QB_BAT_Y0, QB_BAT_X1 - QB_BAT_X0, QB_BAT_Y1 - QB_BAT_Y0, 6, TH->bar);
+    /* Canon's icon: a body with a nub, three cells; red when low */
+    uint8_t col = low ? TH->burst : on_bar(v, C_TEXT);
+    int bx = QB_BAT_X0 + 10, by = QB_BAT_Y0 + 7;
+    gfx_round_frame(c, bx, by, 32, 13, 2, col);
+    gfx_fill(c, bx + 32, by + 4, 3, 5, col);
+    int cells = v->battery_bars <= 0 ? 1 : v->battery_bars == 1 ? 2 : 3;
+    for (int k = 0; k < cells; k++) gfx_fill(c, bx + 3 + k * 9, by + 3, 8, 7, col);
+    gfx_clip_all(c);
+}
+
+int qbar_battery_frame(struct qbar * q, const struct qbar_view * v, struct canvas * c, uint32_t now, struct present * out)
+{
+    out->n = 0;
+    out->x0 = QB_BAT_X0;
+    out->x1 = QB_BAT_X1;
+    int want = (q->state == QB_OPEN || q->state == QB_OPENING) && v->battery_bars >= 0;
+    if (want && (!q->bat_shown || q->bat_drawn != v->battery_bars || q->full_redraw))
+    {
+        render_battery(v, c);
+        add_op(out, QB_BAT_Y0, QB_BAT_Y1, 0);
+        q->bat_shown = 1;
+        q->bat_drawn = v->battery_bars;
+    }
+    else if (!want && q->bat_shown)
+    {
+        gfx_clip(c, QB_BAT_X0, QB_BAT_Y0, QB_BAT_X1, QB_BAT_Y1);
+        gfx_fill(c, QB_BAT_X0, QB_BAT_Y0, QB_BAT_X1 - QB_BAT_X0, QB_BAT_Y1 - QB_BAT_Y0, 0);
+        gfx_clip_all(c);
+        add_op(out, QB_BAT_Y0, QB_BAT_Y1, 1);
+        q->bat_shown = 0;
+    }
+    return out->n ? PF_PRESENTED : 0;
 }
 
 /* the strip above the bar: the controls for a few seconds after opening, then messages */
@@ -202,21 +248,6 @@ static void render_strip(const struct qbar_view * v, struct canvas * c, const ch
     gfx_clip_all(c);
 }
 
-static void add_op(struct present * out, int y0, int y1, int clear)
-{
-    if (y1 <= y0) return;
-    /* merge with the previous op when they touch and are of the same kind */
-    if (out->n && out->op[out->n - 1].clear == clear && y0 <= out->op[out->n - 1].y1)
-    {
-        if (y1 > out->op[out->n - 1].y1) out->op[out->n - 1].y1 = (short)y1;
-        return;
-    }
-    if (out->n >= (int)(sizeof(out->op) / sizeof(out->op[0]))) return;
-    out->op[out->n].y0 = (short)y0;
-    out->op[out->n].y1 = (short)y1;
-    out->op[out->n].clear = (char)clear;
-    out->n++;
-}
 
 int qbar_frame(struct qbar * q, const struct qbar_view * v, struct canvas * c, uint32_t now, struct present * out)
 {

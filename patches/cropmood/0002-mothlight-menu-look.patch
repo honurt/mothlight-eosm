@@ -1,0 +1,140 @@
+diff --git a/src/menu.c b/src/menu.c
+index c8b7ddf..98e47bd 100644
+--- a/src/menu.c
++++ b/src/menu.c
+@@ -51,10 +51,13 @@
+ #define MENU_HELP_Y_POS_2 458
+ #define MENU_WARNING_Y_POS (menu_lv_transparent_mode ? 425 : 458)
+ 
+-#define MENU_BG_COLOR_HEADER_FOOTER 42
++/* Mothlight look: graphite header / footer, lantern-orange accent (patches/cropmood/0002) */
++#define MENU_BG_COLOR_HEADER_FOOTER 40
++#define MOTH_MENU_HL 47
++#define MOTH_MENU_LINE 45
+ 
+ extern int bmp_color_scheme;
+-#define MENU_BAR_COLOR (bmp_color_scheme ? COLOR_LIGHT_BLUE : COLOR_BLUE)
++#define MENU_BAR_COLOR COLOR_ORANGE
+ 
+ #ifdef CONFIG_MENU_ICONS
+ #define SUBMENU_OFFSET 48
+@@ -2326,12 +2329,12 @@ static void pickbox_draw(struct menu_entry * entry, int x0, int y0)
+     w = 720-x0+16; // extend it till the right edge
+     
+     // draw the pickbox
+-    bmp_fill(45, x0-16, y0, w, h+1);
++    bmp_fill(MOTH_MENU_HL, x0-16, y0, w, h+1);
+     for (int i = lo; i <= hi; i++)
+     {
+         int y = y0 + (i-lo) * 32;
+         if (i == sel)
+-            selection_bar_backend(MENU_BAR_COLOR, 45, x0-16, y, w, 32);
++            selection_bar_backend(MENU_BAR_COLOR, MOTH_MENU_HL, x0-16, y, w, 32);
+         bmp_printf(fnt, x0, y, pickbox_string(entry, i));
+     }
+     
+@@ -2357,6 +2360,7 @@ static void menu_clean_footer()
+     if (is_menu_active("Help")) h = font_med.height * 3 + 2;
+     int bgu = MENU_BG_COLOR_HEADER_FOOTER;
+     bmp_fill(bgu, 0, 480-h, 720, h);
++    bmp_fill(MOTH_MENU_LINE, 0, 480-h, 720, 1);
+ }
+ 
+ static int check_default_warnings(struct menu_entry * entry, char* warning)
+@@ -2893,13 +2897,17 @@ skip_name:
+     // selection bar
+     if (entry->selected)
+     {
+-        int color_left = 45;
++        int color_left = MOTH_MENU_HL;
+         int color_right = MENU_BAR_COLOR;
+         if (junkie_mode && !in_submenu) color_left = color_right = COLOR_BLACK;
+         if (customize_mode) { color_left = color_right = get_customize_color(); }
+ 
+         selection_bar_backend(color_left, COLOR_BLACK, xl, y, xc-xl, h-1);
+         selection_bar_backend(color_right, COLOR_BLACK, xc, y, x_end-xc, h-1);
++
++        /* Mothlight: an orange marker at the left of the selected row */
++        if (!junkie_mode && !customize_mode && xl >= 8 && h > 12)
++            bmp_fill(COLOR_ORANGE, xl - 7, y + 5, 4, h - 11);
+         
+         // use a pickbox if possible
+         if (edit_mode && CAN_HAVE_PICKBOX(entry))
+@@ -4046,7 +4054,7 @@ void menus_display(
+     if (customize_mode) fgs = get_customize_color();
+ 
+     bmp_fill(bgu, orig_x, y, 720, 42);
+-    //~ bmp_fill(fgu, orig_x, y+42, 720, 2);
++    bmp_fill(MOTH_MENU_LINE, orig_x, y+42, 720, 1);
+     
+     for( ; menu ; menu = menu->next )
+     {
+@@ -4054,8 +4062,9 @@ void menus_display(
+             continue; // empty menu
+         if (IS_SUBMENU(menu))
+             continue;
+-        int fg = menu->selected ? fgs : fgu;
+-        int bg = menu->selected ? bgs : bgu;
++        int fg = menu->selected ? (customize_mode ? fgs : COLOR_ORANGE) : fgu;
++        int bg = bgu;
++        (void) bgs;
+         
+         if (!menu_lv_transparent_mode)
+         {
+@@ -4072,7 +4081,7 @@ void menus_display(
+                     //~ bmp_printf(FONT_MED, 720 - strlen(menu->name)*font_med.width, 50, menu->name);
+                 //~ else
+                 if (!junkie_mode)
+-                    bmp_printf(FONT(FONT_CANON, fg, NO_BG_ERASE), 5, y, "%s", menu->name);
++                    bmp_printf(FONT(FONT_CANON, COLOR_WHITE, NO_BG_ERASE), 5, y, "%s", menu->name);
+                 
+                 int x1 = x - 1;
+                 int x2 = x1 + icon_spacing + 2;
+@@ -4085,10 +4094,8 @@ void menus_display(
+                 //~ draw_line(x1+4, y+1, x2-4, y+1, fgu);
+                 //~ draw_line(x1+4, y, x2-4, y, fgu);
+ 
+-                draw_line(x1-1, y+40, x2+1, y+40, bgs);
+-                draw_line(x1-2, y+41, x2+2, y+41, bgs);
+-                draw_line(x1-3, y+42, x2+3, y+42, bgs);
+-                draw_line(x1-4, y+43, x2+4, y+43, bgs);
++                /* Mothlight: an orange underline instead of Canon-style tab corners */
++                bmp_fill(COLOR_ORANGE, x1 + 6, y + 38, MAX(x2 - x1 - 12, 4), 3);
+ 
+                 //~ draw_line(x1-4, y+42, x1, y+42-4, fgu);
+                 //~ draw_line(x2+4, y+42, x2, y+42-4, fgu);
+@@ -4100,11 +4107,7 @@ void menus_display(
+                 //~ draw_line(x1, y+4, x1+4, y, fgu);
+                 //~ draw_line(x2, y+4, x2-4, y, fgu);
+                 
+-                draw_line(x1, y+2, x1, y+3, bgu);
+-                draw_line(x1+1, y+2, x1+1, y+2, bgu);
+ 
+-                draw_line(x2, y+2, x2, y+3, bgu);
+-                draw_line(x2-1, y+2, x2-1, y+2, bgu);
+             }
+             x += icon_spacing;
+         }
+@@ -4211,11 +4214,12 @@ submenu_display(struct menu * submenu)
+     {
+         w = 720-2*bx;
+         bmp_fill(MENU_BG_COLOR_HEADER_FOOTER,  bx,  by, w, 40);
++        bmp_fill(COLOR_ORANGE,  bx,  by + 38, w, 2);
+         bmp_fill(COLOR_BLACK,  bx,  by + 40, w, h-40);
+         bmp_printf(FONT(FONT_CANON, COLOR_WHITE, NO_BG_ERASE),  bx + 15,  by+2, "%s", submenu->name);
+ 
+-        for (int i = 0; i < 5; i++)
+-            bmp_draw_rect(45,  bx-i,  by-i, w+i*2, h+i*2);
++        for (int i = 0; i < 3; i++)
++            bmp_draw_rect(MOTH_MENU_LINE,  bx-i,  by-i, w+i*2, h+i*2);
+ 
+ /* gradient experiments
+         for (int i = 0; i < 3; i++)
+@@ -5358,6 +5362,7 @@ menu_init( void )
+     gui_sem = create_named_semaphore( "gui", 0 );
+     menu_redraw_sem = create_named_semaphore( "menu_r", 1);
+ 
++    menu_find_by_name( "Mothlight", 'M'             );  /* Mothlight first (its module fills it) */
+     menu_find_by_name( "Audio",     ICON_ML_AUDIO   );
+     menu_find_by_name( "Expo",      ICON_ML_EXPO    );
+     menu_find_by_name( "Overlay",   ICON_ML_OVERLAY );

@@ -25,8 +25,8 @@ THEN
 
    INFO ............ quick bar: shutter, aperture, ISO, WB, focus, profile
    SET ............. next tile        UP / DOWN ..... change the value
-   MENU tile ....... Mothlight settings (theme, card speed, sound, aids)
-   Two-finger tap .. Magic Lantern's full menu
+   Tap the picture . focus there (Crop Mood presets: at x10, then back)
+   Two-finger tap .. the menu; its first tab is Mothlight (Settings first)
 
 GOOD TO KNOW
  - Canon's firmware is never replaced. Hold SET while switching on to

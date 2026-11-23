@@ -49,7 +49,8 @@ in the release notes.
 ### Quick bar (INFO, default)
 
 - [ ] INFO in movie mode opens the bar at the bottom; LiveView stays visible above it
-- [ ] SET moves between SHUTTER, APERTURE, ISO, WB, FOCUS, PROFILE, MENU; UP / DOWN change the value
+- [ ] SET moves between SHUTTER, APERTURE, ISO, WB, FOCUS, PROFILE; UP / DOWN change the value
+- [ ] Battery at the top-left, like Canon's; red when low; gone when the bar closes
 - [ ] The rear dial changes the shutter (Canon) and the bar follows at once
 - [ ] Tapping a tile selects it; tapping PROFILE again opens the list (check MOTHLOG.TXT "touch" lines)
 - [ ] Shutter shows its angle (green near 180); aperture shows the lens range
@@ -57,7 +58,6 @@ in the release notes.
 - [ ] A manual (adapted) lens: APERTURE says so
 - [ ] UP / DOWN on PROFILE open the profile list; INFO there goes back to the bar; REC starts RAW
 - [ ] No black flash on DOWN or SET
-- [ ] MENU tile: battery icon matches Canon's; "all good" or "N warnings"
 - [ ] Second time the bar opens: the most serious warning shows above it (if any)
 
 ### Focus punch-in (FOCUS tile)
@@ -67,7 +67,28 @@ in the release notes.
 - [ ] REC at x10: the zoom goes back first, then RAW records (not at x10)
 - [ ] Zoomed with Canon's own zoom first: closing the bar leaves that zoom alone
 
-### Settings (MENU tile, or Movie > Mothlight > Settings)
+### Focus in Crop Mood presets (AF lens)
+
+- [ ] Tap the picture: x10 at that spot within ~1 s, Canon's own focus box, it focuses, ~1 s later back to x5
+- [ ] The framing after it is the same as before (nothing shifted)
+- [ ] Half-press: x10 and focus while held; release: back to x5
+- [ ] No ML overlay flash on half-press; no Canon icons flashing after closing the bar in x5
+- [ ] REC while at x10: back to x5 first, then RAW records
+- [ ] MF lens / H.264 profile: tap and half-press behave as Canon's
+- [ ] Settings > Tap / half-press focus: Canon's (x5) gives the old behaviour back
+- [ ] ML/LOGS/MOTHLOG.TXT has "focus: step" lines (send it if the spot is off)
+
+### Recording preview
+
+- [ ] Settings > Screen while recording RAW: "ML framing" removes the vertical lines on screen (clip unaffected)
+
+### Magic Lantern's menu (two-finger tap)
+
+- [ ] Mothlight is the first tab (an M), with Settings, Profiles, Theme ... in it
+- [ ] Graphite header and footer, orange underline under the current tab, orange marker on the selected row
+- [ ] Editing a value: orange highlight; scroll bar orange; submenus with an orange rule under the title
+
+### Settings (Mothlight tab > Settings)
 
 - [ ] Opens full screen; UP / DOWN scroll; the help line explains the selected row
 - [ ] Theme: SET switches it right there; Animations, INFO button, Recording frame change

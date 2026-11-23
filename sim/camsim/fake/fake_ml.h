@@ -13,8 +13,10 @@
 struct cam_state
 {
     int lv_on, dispsize, recording, raw, movie, menu_shown, display_on, front_enabled;
-    int battery;                                 /* PROP_BATTERY_POWER: 0 low, 1 half, 2 full */
+    int battery;
+    int disp_mode;                               /* Canon's INFO display mode (lv_disp_mode) */                                 /* PROP_BATTERY_POWER: 0 low, 1 half, 2 full */
     int playback, canon_menu;
+    int manual_focus;                            /* the lens (or its switch) is on MF */
     struct {
         int focal_len, lens_exists;
         int raw_shutter, raw_aperture, raw_aperture_min, raw_aperture_max, raw_iso, aperture;
@@ -28,6 +30,7 @@ int module_send_keypress(int module_key);
 #define lv            (cam.lv_on)
 #define lv_dispsize   (cam.dispsize)
 #define battery_level_bars (cam.battery)
+#define lv_disp_mode (cam.disp_mode)
 #define RECORDING     (cam.recording)
 #define RECORDING_RAW (cam.recording && cam.raw)
 #define lens_info     (cam.lens)
@@ -46,6 +49,10 @@ int  is_movie_mode(void);
 int  gui_menu_shown(void);
 int  display_is_on(void);
 void set_lv_zoom(int zoom);
+void get_afframe_pos(int W, int H, int * x, int * y);
+void get_afframe_sensor_res(int * W, int * H);
+void move_lv_afframe(int dx, int dy);
+void SW1(int v, int wait);
 int  fps_get_current_x1000(void);
 
 struct menu_display_info { char value[64]; char help[160]; char warning[96]; };

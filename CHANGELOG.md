@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.0 (24 Nov 2026)
+
+- **Tap to focus, the reliable way.** Crop Mood runs every preset in x5 and hides Canon's layer
+  (the focus box with it); its author notes x5 autofocus is inaccurate and x10 is where it works,
+  and a tap in x5 moves Canon's magnified area instead of a focus point. Now, in Crop Mood
+  presets with an AF lens: tap a spot and Mothlight moves Canon's AF point there, zooms to x10
+  with Canon's own focus box, focuses, holds a moment, re-centres and goes back to x5 (the
+  framing is unchanged). Half-press does the same while held. Never while recording; MF lenses,
+  H.264 and "Canon's (x5)" in Settings keep the old behaviour. Every step is logged.
+- **No Canon icon flash after closing** in Crop Mood x5: Mothlight used to switch Canon's layer
+  back on, which crop_rec then hid again. It now leaves it as Crop Mood wants.
+- **Magic Lantern's menu in Mothlight's look** (engine patch 0002): graphite header and footer,
+  orange tab underline, orange marker on the selected row, orange value highlight and scroll bar,
+  and a **Mothlight tab first** (Settings, Profiles, Theme, INFO, focus, ...). This changes
+  autoexec.bin. (The upstream engine keeps ML's look; the tab is added at the end there.)
+- Quick bar: the MENU tile is gone; the **battery** sits top-left where Canon puts it.
+- Settings: "Screen while recording RAW". The vertical lines seen while filming are only in
+  Canon's live preview in Crop Mood (checked in a recorded clip: the RAW is clean); "ML framing"
+  shows a clean, slower preview.
+- Fixed before release by the simulator: REC during a focus job started RAW at x10 (MLV Lite saw
+  LiveView idle; the job now holds ML's GUI state like the bar); a two-finger tap during a focus
+  job looped forever re-sending itself; a lost half-press release could leave x10 on.
+- Corrupt settings are repaired at start-up before ML's menu shows them.
+- Sound effects: not added. ML's audio playback is compiled out on the EOS M, and on the 650D /
+  700D / 100D (same processor) turning it on breaks the module menu or destabilises the camera.
+
 ## 0.3.0 (24 Nov 2026)
 
 - **Settings page**, in Mothlight's look, from the quick bar's new MENU tile or Movie > Mothlight >

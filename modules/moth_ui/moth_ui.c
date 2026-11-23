@@ -34,6 +34,7 @@
 #include <shoot.h>
 #include <gui-common.h>
 #include <lens.h>
+#include <focus.h>
 
 #include "version.h"
 #include "panel.h"
@@ -63,6 +64,7 @@ static CONFIG_INT("moth.bpp11",   cfg_bpp11,   0);
 static CONFIG_INT("moth.bpp12",   cfg_bpp12,   0);
 static CONFIG_INT("moth.bpp14",   cfg_bpp14,   0);
 static CONFIG_INT("moth.welcomed", cfg_welcomed, 0); /* the first-start welcome was shown */
+static CONFIG_INT("moth.focus",   cfg_focus,   1);    /* Crop Mood x5: 1 tap / half-press focus at x10, 0 Canon's */
 
 static const int card_mb[] = { 0, 30, 40, 50, 60, 65, 70, 75, 80, 90 };
 
@@ -205,6 +207,7 @@ static int log_line(char * out, int len, const struct log_ev * e)
                                   (int)e->v, (int)(e->v & 0xffff), (int)(e->v >> 16), e->a ? "  (used)" : "");
         case 'Y': return snprintf(out, len, "%7d  touch 0x%02x  obj 0x%08x arg 0x%x\n", (int)e->t, e->code & 0xffff,
                                   (int)e->v, e->a);
+        case 'F': return snprintf(out, len, "%7d  focus: step %d  %d %d\n", (int)e->t, e->code, e->a, e->b);
         case 'S': return snprintf(out, len, "%7d  settings: item %d%s\n", (int)e->t, e->code, e->a ? " (failed)" : "");
         case 'E': return snprintf(out, len, "%7d  quick bar: setting %d %s, %s\n", (int)e->t, e->code,
                                   e->a > 0 ? "up" : "down", e->b ? "changed" : "unchanged");
@@ -561,14 +564,6 @@ static void qb_fill(struct qbar_view * q)
     else                   { copy_str(it->sub, sizeof(it->sub), "UP x10"); }
     if (zoom_job) { copy_str(it->sub, sizeof(it->sub), "..."); }
 
-    it = &q->item[QB_MENU];
-    copy_str(it->value, sizeof(it->value), "Settings");
-    {
-        struct warning w[8];
-        int nw = collect_warnings(w, 8);
-        if (nw) { snprintf(it->sub, sizeof(it->sub), "%d warning%s", nw, nw > 1 ? "s" : ""); it->sub_tone = QT_BURST; }
-        else    { copy_str(it->sub, sizeof(it->sub), "all good"); it->sub_tone = QT_OK; }
-    }
     q->battery_bars = battery_level_bars;
 
     it = &q->item[QB_PROFILE];
@@ -710,6 +705,137 @@ static void zoom_restore_step(void)
     zoom_restore = 0;
 }
 
+/* ---------------------------------------------------------------- focus at x10
+
+   Crop Mood runs every preset in Canon's x5 mode and hides Canon's layer there; its author
+   notes that autofocus in x5 "won't give accurate results" (the modified preview breaks the
+   AF data) and that x10 is where focusing works. And a tap in x5 moves Canon's magnified
+   area, i.e. the recorded window, instead of a focus point. So in those presets Mothlight
+   takes taps and half-presses (never while recording) and does it the reliable way:
+
+     move Canon's AF point to the tapped spot -> x10 there, Canon's layer on (its real focus
+     box) -> autofocus (ML's SW1) -> hold to look -> AF point back to the centre -> x5
+
+   The recorded framing ends where it was: the AF point is centred again before x5. */
+
+enum { FJ_IDLE, FJ_ZOOM, FJ_AF, FJ_HOLD, FJ_BACK };
+static volatile int fj_state;              /* the focus job's phase (FJ_IDLE: none) */
+static volatile int fj_from_half;          /* started by half-press: hold while it is held */
+static volatile int fj_half_held;
+static volatile int fj_tap_x = -1, fj_tap_y;
+static volatile int fj_cancel;             /* a key asked to finish early */
+static volatile uint32_t fj_rec_after;     /* REC pressed meanwhile: record once back at x5 */
+static volatile int fj_resent;             /* a key we sent on ourselves (it comes back once) */
+static int fj_moved_dx, fj_moved_dy;       /* how far the AF point was moved (undone before x5) */
+static int fj_focused;                     /* the last AF confirmed focus */
+
+static int focus_takes_over(void)
+{
+    if (!cfg_focus || !lv || RECORDING || !is_movie_mode() || gui_menu_shown() || overlay_active) return 0;
+    if (!lens_info.lens_exists || is_manual_focus()) return 0;      /* MF: Crop Mood's own x10 key */
+    int mood = menu_get_value_from_script("Movie", "Crop mood");
+    return mood != INT_MIN && mood > 0 && lv_dispsize == 5;
+}
+
+/* screen point -> where Canon's AF point must go (its own coordinates, the whole sensor):
+   the x5 preview shows the recorded window, centred on the sensor, across the screen width */
+static void tap_to_afframe(int x, int y, int * dx, int * dy)
+{
+    int W = 0, H = 0, cx, cy;
+    get_afframe_sensor_res(&W, &H);
+    *dx = *dy = 0;
+    if (W <= 0 || H <= 0) return;
+    get_afframe_pos(W, H, &cx, &cy);
+    const struct rec_profile * p = (cfg_active >= 0 && cfg_active < profile_count) ? &profiles[cfg_active] : 0;
+    int w = live_fmt.width > 0 ? live_fmt.width : p ? p->nominal.width : 0;
+    int h = live_fmt.height > 0 ? live_fmt.height : p ? p->nominal.height : 0;
+    if (w <= 0 || h <= 0) return;
+    int mood = p ? p->mood : MOOD_1X1;
+    int span_x = w * (mood == MOOD_1X1 ? 1 : 3);       /* 1x3 and 3x3 bin columns by 3 */
+    int span_y = h * (mood == MOOD_3X3 ? 3 : 1);
+    if (span_x > W) span_x = W;
+    if (span_y > H) span_y = H;
+    int disp_h = UI_W * span_y / span_x;                  /* the picture's height on screen */
+    if (disp_h > UI_H) disp_h = UI_H;
+    if (disp_h < 1) disp_h = 1;
+    int tx = W / 2 + (x - UI_W / 2) * span_x / UI_W;
+    int ty = H / 2 + (y - UI_H / 2) * span_y / disp_h;
+    *dx = tx - cx;
+    *dy = ty - cy;
+    mlog_v('F', 9, x, y, (uint32_t)(W << 16 | (H & 0xffff)));
+}
+
+static void focus_task(void * arg)
+{
+    int start_zoom_level = lv_dispsize;
+    /* 1. the AF point to the tapped spot (in x5: Canon moves its magnified area with it) */
+    fj_moved_dx = fj_moved_dy = 0;
+    if (fj_tap_x >= 0)
+    {
+        int dx, dy;
+        tap_to_afframe(fj_tap_x, fj_tap_y, &dx, &dy);
+        if (dx || dy) { move_lv_afframe(dx, dy); fj_moved_dx = dx; fj_moved_dy = dy; }
+        mlog('F', 1, dx, dy);
+    }
+    /* 2. x10 there, with Canon's layer on: its real focus box */
+    fj_state = FJ_ZOOM;
+    if (!fj_cancel) set_lv_zoom(10);
+    if (lv_dispsize == 10) canon_gui_enable_front_buffer(0);
+    mlog('F', 2, lv_dispsize, 0);
+    /* 3. autofocus, the way ML does it (half-shutter switch), until Canon confirms */
+    fj_state = FJ_AF;
+    fj_focused = 0;
+    if (!fj_cancel && lv_dispsize == 10)
+    {
+        SW1(1, 50);
+        uint32_t t0 = get_ms_clock();
+        while (!fj_cancel && get_ms_clock() - t0 < 2000)
+        {
+            if (get_focus_confirmation()) { fj_focused = 1; break; }
+            msleep(40);
+        }
+        msleep(fj_focused ? 150 : 0);       /* let the lens settle */
+        SW1(0, 50);
+    }
+    mlog('F', 3, fj_focused, 0);
+    /* 4. look: while the half-press is held, or a moment after a tap */
+    fj_state = FJ_HOLD;
+    {
+        uint32_t t0 = get_ms_clock();
+        /* a lost half-press release (ML's menu opened meanwhile, the display went off ...)
+           must not leave the camera at x10: those end it too, and 30 s at most */
+        while (!fj_cancel && lv && !RECORDING && !gui_menu_shown() && is_movie_mode() && display_is_on())
+        {
+            if (fj_from_half ? !fj_half_held : get_ms_clock() - t0 > 1200) break;
+            if (get_ms_clock() - t0 > 30000) break;
+            msleep(30);
+        }
+    }
+    /* 5. AF point back to the centre, then x5 (via x1, as Crop Mood does) */
+    fj_state = FJ_BACK;
+    if (fj_moved_dx || fj_moved_dy) { move_lv_afframe(-fj_moved_dx, -fj_moved_dy); fj_moved_dx = fj_moved_dy = 0; }
+    if (lv_dispsize != start_zoom_level) { set_lv_zoom(1); set_lv_zoom(start_zoom_level == 10 ? 5 : start_zoom_level); }
+    mlog('F', 4, lv_dispsize, fj_cancel);
+    fj_tap_x = -1;
+    fj_cancel = 0;
+    if (!overlay_active) release_gui_state();
+    fj_state = FJ_IDLE;
+}
+
+static void focus_start(int x, int y, int from_half)
+{
+    if (fj_state != FJ_IDLE || zoom_job) return;
+    fj_tap_x = x; fj_tap_y = y;
+    fj_from_half = from_half;
+    fj_half_held = from_half;
+    fj_cancel = 0;
+    fj_state = FJ_ZOOM;
+    /* ML's GUI state busy, as with the bar: MLV Lite would otherwise start RAW on REC at x10,
+       and ML's own long-press checks would redraw over Canon's x10 view */
+    hold_gui_state();
+    task_create("moth_focus", 0x1e, 0x1000, (void *) focus_task, 0);
+}
+
 /* ---------------------------------------------------------------- saving the current setup */
 
 static int menu_int(const char * menu, const char * entry, int lo, int hi)
@@ -778,7 +904,7 @@ static void save_current_profile(char * msg, int len, int * bad)
 /* ---------------------------------------------------------------- the settings page */
 
 enum { SI_THEME = 1, SI_MOTION, SI_INFO, SI_TALLY, SI_SDCLOCK, SI_CARD, SI_SOUND, SI_HACKS,
-       SI_OVERLAYS, SI_ZEBRAS, SI_PEAK, SI_FALSECOLOR, SI_SAVE, SI_LEARNED, SI_WELCOME,
+       SI_OVERLAYS, SI_ZEBRAS, SI_PEAK, SI_FALSECOLOR, SI_SAVE, SI_LEARNED, SI_WELCOME, SI_FOCUS, SI_PREVIEW,
        SI_WELCOME_DONE, SI_CHECK_CROP, SI_CHECK_RAW, SI_CHECK_SD, SI_CHECK_EXPO, SI_CHECK_SOUND };
 
 static const char * theme_names[] = { "Mothlight", "Stock", "Studio", "Amber", "Signal", "Material",
@@ -822,8 +948,9 @@ static void build_welcome(struct settings_view * v)
     add_row(v, SR_SECTION, 0, 0, "HOW IT WORKS", 0, 0);
     add_row(v, SR_NOTE, 0, 0, "INFO opens the quick bar at the bottom of the screen", 0, 0);
     add_row(v, SR_NOTE, 0, 0, "SET moves between tiles, UP / DOWN changes the value", 0, 0);
+    add_row(v, SR_NOTE, 0, 0, "Tap the picture (or half-press) to focus there at x10", 0, 0);
     add_row(v, SR_NOTE, 0, 0, "PROFILE: recording presets.  FOCUS: x10 punch-in", 0, 0);
-    add_row(v, SR_NOTE, 0, 0, "MENU: these settings.  Two-finger tap: ML's own menu", 0, 0);
+    add_row(v, SR_NOTE, 0, 0, "Two-finger tap: the menu, with Mothlight's settings first", 0, 0);
 
     add_row(v, SR_SECTION, 0, 0, "SETUP CHECK", 0, 0);
     int crop = menu_get_value_from_script("Movie", "Crop mood") != INT_MIN;
@@ -897,11 +1024,19 @@ static void build_settings(struct settings_view * v)
     ml_value(val, sizeof(val), "RAW video", "Sound recording", offon, 2, &tone);
     add_row(v, SR_ITEM, SI_SOUND, tone, "Sound with RAW video", val,
             "Records a WAV next to the MLV. Turn it off at 240 MHz or for heavy profiles: it can stop RAW recording.");
+    {
+        static const char * prev[] = { "Auto", "Canon (live)", "ML framing", "Frozen" };
+        ml_value(val, sizeof(val), "RAW video", "Preview", prev, 4, &tone);
+        add_row(v, SR_ITEM, SI_PREVIEW, tone, "Screen while recording RAW", val,
+                "Canon (live) is smooth but can show vertical lines in Crop Mood; they are not in the clip. ML framing is clean, slower.");
+    }
     ml_value(val, sizeof(val), "RAW video", "Small hacks", hacks, 4, &tone);
     add_row(v, SR_ITEM, SI_HACKS, tone, "Small hacks", val,
             "Pauses some of Canon's background work while recording, leaving more speed for the card.");
 
     add_row(v, SR_SECTION, 0, 0, "FOCUS AND EXPOSURE AIDS", 0, 0);
+    add_row(v, SR_ITEM, SI_FOCUS, 0, "Tap / half-press focus", cfg_focus ? "At x10 (accurate)" : "Canon's (x5)",
+            "Crop Mood presets: tap a spot or half-press, Mothlight focuses there at x10 (where AF is reliable), then goes back.");
     add_row(v, SR_ITEM, SI_OVERLAYS, saved_global_draw < 0 ? ST_DIM : 0, "ML overlays",
             saved_global_draw < 0 ? "?" : saved_global_draw > 0 ? "On" : "Off",
             "Magic Lantern's drawings over LiveView. The aids below need it on. Hidden while Mothlight is open.");
@@ -954,6 +1089,7 @@ static void settings_activate(int id, uint32_t now)
     {
         case SI_THEME:   cfg_theme = (cfg_theme + 1) % THEME_COUNT; break;
         case SI_MOTION:  cfg_motion = !cfg_motion; break;
+        case SI_FOCUS:   cfg_focus = !cfg_focus; break;
         case SI_INFO:    cfg_key = (cfg_key + 1) % 3; break;
         case SI_TALLY:   cfg_tally = (cfg_tally + 1) % 3; break;
         case SI_SDCLOCK:
@@ -963,6 +1099,7 @@ static void settings_activate(int id, uint32_t now)
         case SI_CARD:    cfg_card = (cfg_card + 1) % (int)COUNT(card_mb); break;
         case SI_SOUND:   CYCLE("RAW video", "Sound recording", 2, "Load mlv_snd in Magic Lantern's Modules tab"); break;
         case SI_HACKS:   CYCLE("RAW video", "Small hacks", 3, "Small hacks need mlv_lite"); break;
+        case SI_PREVIEW: CYCLE("RAW video", "Preview", 4, "The preview setting needs mlv_lite"); break;
         case SI_OVERLAYS:
             /* Global Draw is off while Mothlight is open; this sets what comes back */
             if (saved_global_draw < 0) { snprintf(msg, sizeof(msg), "ML overlays are not available"); bad = 1; }
@@ -1050,6 +1187,28 @@ static int rows_disturbed(int y0, int y1)
     return 0;
 }
 
+/* Canon's overlay layer back on after Mothlight -- except where Crop Mood keeps it off (its x5
+   modes, Canon's clean display), or its icons would flash up until crop_rec hides them again */
+static int crop_mood_hides_canon(void)
+{
+    int mood = menu_get_value_from_script("Movie", "Crop mood");
+    return mood != INT_MIN && mood > 0 && lv_dispsize == 5 && !RECORDING && lv_disp_mode == 0;
+}
+
+static void canon_layer_back(void)
+{
+    if (!crop_mood_hides_canon()) canon_gui_enable_front_buffer(1);
+}
+
+static int rect_disturbed(int x0, int x1, int y0, int y1)
+{
+    uint8_t * front = bmp_vram_real();
+    if (!front || !back_buf) return 0;
+    for (int y = y0 + 1; y < y1; y += 3)
+        if (memcmp(front + y * BMPPITCH + x0, back.px + y * back.pitch + x0, x1 - x0)) return 1;
+    return 0;
+}
+
 static int overlay_begin(void)
 {
     /* the panel's own full-screen buffer (338 KB), allocated only while the panel is open */
@@ -1102,7 +1261,7 @@ static void overlay_end(int why)
     saved_global_draw = -1;
     /* an instant close leaves the panel's pixels behind; ML's menu repaints itself */
     if (!gui_menu_shown()) clrscr();
-    canon_gui_enable_front_buffer(1);
+    canon_layer_back();
     free(back_buf);
     back_buf = 0;
     redraw();
@@ -1228,6 +1387,7 @@ static void moth_task(void)
     {
         uint32_t now = get_ms_clock();
 
+        if (open_request && !overlay_active && fj_state != FJ_IDLE) { open_request = 0; }
         if (open_request && !overlay_active)
         {
             int mode = open_request;
@@ -1377,21 +1537,8 @@ static void moth_task(void)
                 }
                 if (act == QA_LOCKED) qbar_toast(&qbar, qb_locked_reason(qbar.adj_item), 0, now);
                 if (act == QA_OPEN_PANEL) { to_panel = 1; break; }
-                if (act == QA_OPEN_SETTINGS) { to_panel = 2; break; }
             }
             if (closed) continue;
-
-            if (to_panel == 2)
-            {
-                memset(back_buf, 0, UI_W * UI_H);
-                qbar.state = QB_CLOSED;
-                ov_mode = OV_SETTINGS;
-                settings_from_bar = 1;
-                build_settings(&sview);
-                settings_open(&sets, &sview, now);
-                mlog('O', cfg_theme, profile_count, OV_SETTINGS);
-                continue;
-            }
 
             if (to_panel)
             {
@@ -1413,7 +1560,8 @@ static void moth_task(void)
             {
                 static struct qbar_view fresh;
                 qb_fill(&fresh);
-                if (memcmp(fresh.item, qview.item, sizeof(fresh.item))) { qview = fresh; qbar_changed(&qbar); }
+                if (memcmp(fresh.item, qview.item, sizeof(fresh.item)) || fresh.battery_bars != qview.battery_bars)
+                    { qview = fresh; qbar_changed(&qbar); }
                 qview_read_at = now;
             }
 
@@ -1428,8 +1576,9 @@ static void moth_task(void)
             else lv_lost_at = 0;
             if (why) { overlay_end(why); continue; }
 
-            struct present out;
+            struct present out, bat;
             last_frame_ms = now;
+            if (qbar_battery_frame(&qbar, &qview, &back, now, &bat) & PF_PRESENTED) present(&bat);
             int fl = qbar_frame(&qbar, &qview, &back, now, &out);
             if (fl & PF_PRESENTED) present(&out);
             if (qbar_settled(&qbar))
@@ -1438,6 +1587,12 @@ static void moth_task(void)
                 int y0 = qbar.strip_shown ? QB_STRIP_Y : QB_Y;
                 if ((int32_t)(repaint_until - now) > 0) present_rows(y0, UI_H);
                 else if (rows_disturbed(y0, UI_H)) { present_rows(y0, UI_H); mlog('R', 0, 0, 0); }
+                /* the battery chip: only its own rectangle (Canon's icons may sit beside it) */
+                if (qbar.bat_shown && rect_disturbed(QB_BAT_X0, QB_BAT_X1, QB_BAT_Y0, QB_BAT_Y1))
+                {
+                    struct present r = { QB_BAT_X0, QB_BAT_X1, 1, { { QB_BAT_Y0, QB_BAT_Y1, 0 } } };
+                    present(&r);
+                }
             }
             if (fl & PF_CLOSED) overlay_end(CLOSE_KEY);
             msleep(20);
@@ -1511,6 +1666,11 @@ static void moth_task(void)
         }
 
         if (!overlay_active) zoom_restore_step();
+        if (fj_rec_after && fj_state == FJ_IDLE && !overlay_active)
+        {
+            if (lv && lv_dispsize != 10 && !RECORDING) { fj_rec_after = 0; mlog('F', 5, 0, 0); module_send_keypress(MODULE_KEY_REC); }
+            else if (now - fj_rec_after > 5000) fj_rec_after = 0;
+        }
 
         /* the first start after installing: the welcome page, once LiveView has settled */
         {
@@ -1555,11 +1715,42 @@ static void moth_task(void)
 
 static unsigned int moth_keypress_cbr(unsigned int key)
 {
+    if (!overlay_active && fj_state != FJ_IDLE)
+    {
+        /* the focus job is showing x10 */
+        if (key == MODULE_KEY_UNPRESS_HALFSHUTTER) { fj_half_held = 0; return 0; }
+        if (key == MODULE_KEY_PRESS_HALFSHUTTER) return 0;
+        if (key == MODULE_KEY_REC) { fj_rec_after = get_ms_clock() | 1; fj_cancel = 1; return 0; }
+        if (key == MODULE_KEY_TOUCH_2_FINGER || key == MODULE_KEY_PLAY)
+        {
+            /* ML's menu / playback: let them through now (ML needs its idle state for that).
+               The key we send comes back through here: that copy goes on (no loop). */
+            if (fj_resent == (int)key) { fj_resent = 0; return 1; }
+            fj_cancel = 1;
+            release_gui_state();
+            fj_resent = (int)key;
+            module_send_keypress(key);
+            return 0;
+        }
+        if (key == MODULE_KEY_TOUCH_1_FINGER || key == MODULE_KEY_UNTOUCH_1_FINGER) return 0;
+        if (key == MODULE_KEY_INFO || key == MODULE_KEY_PRESS_SET || key == MODULE_KEY_PRESS_UP ||
+            key == MODULE_KEY_PRESS_DOWN || key == MODULE_KEY_MENU || key == MODULE_KEY_TRASH)
+            { fj_cancel = 1; return 0; }
+        return 1;
+    }
+    if (!overlay_active && key == MODULE_KEY_PRESS_HALFSHUTTER && focus_takes_over())
+    {
+        focus_start(-1, 0, 1);
+        return 0;
+    }
+    if (!overlay_active && (key == MODULE_KEY_TOUCH_1_FINGER || key == MODULE_KEY_UNTOUCH_1_FINGER) &&
+        focus_takes_over())
+        return 0;                           /* the raw handler took this tap */
     if (overlay_active && (keys_released || get_ms_clock() - last_frame_ms > 2000))
     {
         /* The panel task stopped drawing: never hold the camera's buttons hostage. Only flag
            it here (this is the GUI task); the panel task frees and restores when it wakes. */
-        if (!keys_released) { release_gui_state(); canon_gui_enable_front_buffer(1); }
+        if (!keys_released) { release_gui_state(); canon_layer_back(); }
         keys_released = 1;
         return 1;
     }
@@ -1646,6 +1837,23 @@ static unsigned int moth_keypress_raw_cbr(unsigned int raw)
 {
     const struct event * e = (const struct event *) raw;
     if (e && e->type == 0 && e->param >= 0 && logging()) mlog('K', e->param, overlay_active, IS_FAKE(e) ? 1 : 0);
+    if (e && e->type == 0 && !overlay_active && !IS_FAKE(e))
+    {
+        /* focus at x10: a tap picks the spot (Canon would move the recorded window instead) */
+        int p = e->param;
+        if ((p == EOSM_TOUCH_1 || p == EOSM_UNTOUCH_1) && (fj_state != FJ_IDLE || focus_takes_over()))
+        {
+            int x, y; uint32_t v;
+            int ok = touch_pos(&x, &y, &v);
+            mlog_v('X', p, ok, 2, v);
+            if (p == EOSM_UNTOUCH_1)
+            {
+                if (fj_state != FJ_IDLE) fj_cancel = 1;                 /* a second tap: done looking */
+                else focus_start(ok ? x : UI_W / 2, ok ? y : UI_H / 2, 0);
+            }
+            return 0;
+        }
+    }
     if (!overlay_active || keys_released || handing_back) return 1;
     if (e && e->type == 0 && (e->param == EOSM_TOUCH_1 || e->param == EOSM_UNTOUCH_1 || e->param == 0x0f || e->param == 0x11))
     {
@@ -1718,55 +1926,63 @@ static MENU_UPDATE_FUNC(about_update)
                   MOTH_UI_ENGINE, profile_count, profiles_from_file ? " from PROFILES.TXT" : " (built in)");
 }
 
+/* Mothlight's own tab, first in Magic Lantern's menu (the menu patch creates it there; on an
+   engine without the patch ML adds it at the end) */
 static struct menu_entry moth_menu[] =
 {
     {
-        .name    = "Mothlight",
+        .name = "Settings", .select = open_settings_from_menu,
+        .help = "Mothlight's settings page: look, focus, card, sound, aids, profiles.",
+        .help2 = "Plain words and a help line for each; everything else stays in these tabs.",
+    },
+    {
+        .name    = "Profiles",
         .select  = open_from_menu,
         .update  = main_update,
-        .help    = "Recording profiles for the EOS M. Opens the profile panel.",
-        .help2   = "Shortcut in LiveView: the INFO button (change it below).",
+        .help    = "Choose and apply a recording profile (Crop Mood presets).",
+        .help2   = "Shortcut in LiveView: INFO opens the quick bar, PROFILE opens the list.",
         .depends_on = DEP_MOVIE_MODE,
-        .children = (struct menu_entry[]) {
-            { .name = "Open profiles", .select = open_from_menu, .help = "Choose and apply a recording profile." },
-            { .name = "Settings", .select = open_settings_from_menu, .help = "Mothlight's settings page: look, card, sound, aids, profiles." },
-            {
-                .name = "Theme", .priv = &cfg_theme, .max = THEME_COUNT - 1,
-                .choices = CHOICES("Mothlight", "Stock", "Studio", "Amber", "Signal", "Material",
-                                   "Soft", "Glass", "Daylight", "Night", "Mono"),
-                .help = "How the panel looks. Takes effect the next time the panel opens.",
-            },
-            {
-                .name = "INFO opens", .priv = &cfg_key, .max = 2,
-                .choices = CHOICES("nothing", "Quick bar", "Profiles"),
-                .help = "Quick bar: shutter, aperture, ISO, WB and profile over LiveView.",
-                .help2 = "Profiles: the profile list directly. 'nothing' gives INFO back to Canon.",
-            },
-            {
-                .name = "Animations", .priv = &cfg_motion, .max = 1,
-                .choices = CHOICES("OFF", "Smooth"),
-                .help = "Panel animations. They never run while recording.",
-            },
-            {
-                .name = "Card write speed", .priv = &cfg_card, .max = COUNT(card_mb) - 1,
-                .choices = CHOICES("Auto (SD clock)", "30 MB/s", "40 MB/s", "50 MB/s", "60 MB/s",
-                                   "65 MB/s", "70 MB/s", "75 MB/s", "80 MB/s", "90 MB/s"),
-                .help = "Used for the continuous / edge / burst verdicts.",
-                .help2 = "Measure your card with Debug > Benchmarks, then set it here.",
-            },
-            {
-                .name = "REC tally", .priv = &cfg_tally, .max = 2,
-                .choices = CHOICES("OFF", "Red frame", "Pulsing frame"),
-                .help = "A red frame round the screen while recording.",
-            },
-            {
-                .name = "Compression", .update = learned_update, .select = learned_reset,
-                .help = "Learned from your clips after each recording. SET resets it.",
-            },
-            { .name = "About", .update = about_update, .icon_type = IT_ALWAYS_ON },
-            MENU_EOL,
-        },
     },
+    {
+        .name = "Theme", .priv = &cfg_theme, .max = THEME_COUNT - 1,
+        .choices = CHOICES("Mothlight", "Stock", "Studio", "Amber", "Signal", "Material",
+                           "Soft", "Glass", "Daylight", "Night", "Mono"),
+        .help = "How Mothlight looks. Takes effect the next time it opens.",
+    },
+    {
+        .name = "INFO opens", .priv = &cfg_key, .max = 2,
+        .choices = CHOICES("nothing", "Quick bar", "Profiles"),
+        .help = "Quick bar: shutter, aperture, ISO, WB, focus and profile over LiveView.",
+        .help2 = "Profiles: the profile list directly. 'nothing' gives INFO back to Canon.",
+    },
+    {
+        .name = "Tap / half-press focus", .priv = &cfg_focus, .max = 1,
+        .choices = CHOICES("Canon's (x5)", "At x10"),
+        .help = "Crop Mood presets: focus where you tap (or on half-press) at x10, then back.",
+        .help2 = "Crop Mood's x5 autofocus is unreliable; x10 is where Canon's AF works.",
+    },
+    {
+        .name = "Animations", .priv = &cfg_motion, .max = 1,
+        .choices = CHOICES("OFF", "Smooth"),
+        .help = "Slides and fades. They never run while recording.",
+    },
+    {
+        .name = "Card write speed", .priv = &cfg_card, .max = COUNT(card_mb) - 1,
+        .choices = CHOICES("Auto (SD clock)", "30 MB/s", "40 MB/s", "50 MB/s", "60 MB/s",
+                           "65 MB/s", "70 MB/s", "75 MB/s", "80 MB/s", "90 MB/s"),
+        .help = "Used for the continuous / edge / burst verdicts.",
+        .help2 = "Measure your card with Debug > Benchmarks, then set it here.",
+    },
+    {
+        .name = "REC tally", .priv = &cfg_tally, .max = 2,
+        .choices = CHOICES("OFF", "Red frame", "Pulsing frame"),
+        .help = "A red frame round the screen while recording.",
+    },
+    {
+        .name = "Compression", .update = learned_update, .select = learned_reset,
+        .help = "Learned from your clips after each recording. SET resets it.",
+    },
+    { .name = "About Mothlight", .update = about_update, .icon_type = IT_ALWAYS_ON },
 };
 
 /* ---------------------------------------------------------------- LiveView info item */
@@ -1826,7 +2042,14 @@ static unsigned int moth_init(void)
         ui_text_set_font(i, (const struct ui_rbf *)font_dynamic[i].bitmap);
     load_profiles();
     bpp_from_config();
-    menu_add("Movie", moth_menu, COUNT(moth_menu));
+    /* a damaged config must not reach ML's menu as an out-of-range choice */
+    if (cfg_theme < 0 || cfg_theme >= THEME_COUNT) cfg_theme = THEME_MOTHLIGHT;
+    if (cfg_key < 0 || cfg_key > 2) cfg_key = 1;
+    if (cfg_motion < 0 || cfg_motion > 1) cfg_motion = 1;
+    if (cfg_focus < 0 || cfg_focus > 1) cfg_focus = 1;
+    if (cfg_tally < 0 || cfg_tally > 2) cfg_tally = 1;
+    if (cfg_card < 0 || cfg_card >= (int)COUNT(card_mb)) cfg_card = 0;
+    menu_add("Mothlight", moth_menu, COUNT(moth_menu));
     lvinfo_add_items(info_items, COUNT(info_items));
     task_create("moth_ui", 0x1e, 0x2000, moth_task, 0);
     return 0;
