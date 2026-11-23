@@ -54,6 +54,12 @@ If the camera ever locks up, take the battery out at once (a stuck processor get
 - Set *Debug > SD Overclock* to **160MHz** and restart if you want 3K / 2.8K. Then measure the card in
   *Debug > Benchmarks > Card benchmark* and enter the result under *Movie > Mothlight > Card write speed*.
 
+## Keep Canon one button away
+
+Canon's firmware is never replaced. Hold **SET** at power-on to start plain Canon, or make the card start as
+Canon by default and hold SET for Mothlight. Also copy `ML/LOGS/ROM0.BIN` and `ROM1.BIN` (your camera's own
+firmware backup, written on the first start) to your computer. Details: [SWITCHING.md](SWITCHING.md).
+
 ## Picture quality setting
 
 Crop Mood records longer with Canon's image quality set to **RAW** (*Menu > Shooting > Image quality*). It

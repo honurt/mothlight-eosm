@@ -35,6 +35,8 @@ Mothlight is a Magic Lantern distribution made for one camera: the 2012 **Canon 
 
 You need an original EOS M on **firmware 2.0.2**, a fast UHS-I SD card, and 10 minutes.
 **Read [docs/INSTALL.md](docs/INSTALL.md) first.** It covers backing up your card, setting the boot flag, and how to uninstall.
+Canon's firmware is never replaced: one card can start as Canon or as Mothlight, chosen by holding SET
+([docs/SWITCHING.md](docs/SWITCHING.md)).
 
 1. Download `Mothlight-<version>-cropmood-<date>.zip` from [Releases](../../releases) (or build it, below).
 2. Back up the card, format it **in the camera**, and unzip everything to the card's root.
