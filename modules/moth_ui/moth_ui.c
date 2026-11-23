@@ -85,6 +85,28 @@ static volatile int opening;                /* overlay_begin() in progress (the 
 static int overlay_active;
 static volatile uint32_t last_frame_ms;     /* watchdog: the key handler gives keys back if this stops moving */
 static volatile int keys_released;          /* watchdog tripped: keys go to Canon until the task cleans up */
+static volatile int handing_back;           /* REC / PLAY / shutter pressed: everything passes while we close */
+
+/* While the panel is up, ML must not treat LiveView as idle. On the EOS M its core catches
+   DOWN and SET in idle LiveView for a long-press check, and on release redraws the screen:
+   it wipes the overlay and paints black letterbox bars (idle_kill_flicker) -- the black flash.
+   gui_state is only ML's copy of Canon's GUI state (Canon is not affected); a value Canon never
+   uses makes those checks skip. It is put back the moment we close, before any key that needs
+   ML's idle handling (REC for MLV Lite) is passed on. If Canon changes state meanwhile, its
+   property handler overwrites our value and we leave it alone. */
+#define MOTH_GUI_STATE 0x6D
+static volatile int saved_gui_state = -1;
+static void hold_gui_state(void)
+{
+    if (gui_state == MOTH_GUI_STATE) return;
+    saved_gui_state = gui_state;
+    gui_state = MOTH_GUI_STATE;
+}
+static void release_gui_state(void)
+{
+    if (gui_state == MOTH_GUI_STATE && saved_gui_state >= 0) gui_state = saved_gui_state;
+    saved_gui_state = -1;
+}
 static uint32_t lv_lost_at;                 /* LiveView went away (Crop Mood restarts it while applying) */
 static int saved_global_draw = -1;
 
@@ -454,10 +476,12 @@ static int overlay_begin(void)
     msleep(50);
     clrscr();
     key_head = key_tail = 0;                /* nothing from a previous session */
+    handing_back = 0;
     repaint_until = get_ms_clock() + 300;
     keys_released = 0;
     lv_lost_at = 0;
     last_frame_ms = get_ms_clock();
+    hold_gui_state();
     overlay_active = 1;
     return 1;
 }
@@ -467,6 +491,7 @@ static void overlay_end(int why)
     mlog('C', why, 0, 0);
     log_dirty = 1;
     closed_at = get_ms_clock();
+    release_gui_state();
     overlay_active = 0;
     panel.state = PS_CLOSED;
     apply_phase = 0;                        /* an apply cut short is not resumed on the next open */
@@ -698,15 +723,32 @@ static unsigned int moth_keypress_cbr(unsigned int key)
     {
         /* The panel task stopped drawing: never hold the camera's buttons hostage. Only flag
            it here (this is the GUI task); the panel task frees and restores when it wakes. */
-        if (!keys_released) canon_gui_enable_front_buffer(1);
+        if (!keys_released) { release_gui_state(); canon_gui_enable_front_buffer(1); }
         keys_released = 1;
         return 1;
     }
+    if (overlay_active && handing_back) return 1;
     if (overlay_active)
     {
         struct key_route r = moth_route_key(key);
-        if (r.panel_key != PK_NONE) push_key(r.panel_key);
         mlog('P', key, r.panel_key, r.pass_to_canon);
+        if (r.panel_key == PK_CLOSE_NOW)
+        {
+            /* REC / PLAY / shutter: ML must see LiveView idle again before the key goes on
+               (MLV Lite only starts RAW recording from idle LiveView). Put the state back,
+               swallow this event and send the key again through ML. */
+            release_gui_state();
+            handing_back = 1;
+            push_key(PK_CLOSE_NOW);
+            if (key == MODULE_KEY_REC || key == MODULE_KEY_LV || key == MODULE_KEY_PLAY ||
+                key == MODULE_KEY_TOUCH_2_FINGER)
+            {
+                module_send_keypress(key);
+                return 0;
+            }
+            return 1;                       /* shutter: Canon focuses / shoots, not ML's state */
+        }
+        if (r.panel_key != PK_NONE) push_key(r.panel_key);
         return r.pass_to_canon;
     }
 
@@ -735,17 +777,22 @@ static unsigned int moth_keypress_cbr(unsigned int key)
 #define EOSM_UNPRESS_RIGHT 0x27
 #define EOSM_UNPRESS_LEFT  0x29
 #define EOSM_UNPRESS_DOWN  0x2d
+#define EOSM_Q_SET         0x1d   /* SET's real press code; ML turns it into SET after its long-press check */
 
 static unsigned int moth_keypress_raw_cbr(unsigned int raw)
 {
     const struct event * e = (const struct event *) raw;
     if (e && e->type == 0 && e->param >= 0 && logging()) mlog('K', e->param, overlay_active, IS_FAKE(e) ? 1 : 0);
-    if (!overlay_active || keys_released) return 1;
+    if (!overlay_active || keys_released || handing_back) return 1;
     if (e && e->type == 0)
         switch (e->param)
         {
             case EOSM_UNPRESS_UP: case EOSM_UNPRESS_RIGHT:
             case EOSM_UNPRESS_LEFT: case EOSM_UNPRESS_DOWN:
+                return 0;
+            case EOSM_Q_SET:
+                /* with LiveView not idle for ML, SET arrives as itself, not as ML's fake SET */
+                push_key(PK_SET);
                 return 0;
         }
     return 1;

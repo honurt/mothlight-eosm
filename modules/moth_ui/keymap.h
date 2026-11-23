@@ -33,6 +33,7 @@ static inline struct key_route moth_route_key(int key)
 
         case MODULE_KEY_PRESS_HALFSHUTTER: case MODULE_KEY_PRESS_FULLSHUTTER:
         case MODULE_KEY_REC: case MODULE_KEY_LV: case MODULE_KEY_PLAY:
+        case MODULE_KEY_TOUCH_2_FINGER:     /* two-finger tap: ML's menu */
             r.panel_key = PK_CLOSE_NOW; r.pass_to_canon = 1; break; /* close, and still focus /
                                                                        shoot / record / play */
         case MODULE_KEY_MENU: case MODULE_KEY_INFO: case MODULE_KEY_TRASH: case MODULE_KEY_Q:

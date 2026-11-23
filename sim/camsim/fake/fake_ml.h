@@ -17,6 +17,8 @@ struct cam_state
     struct { int focal_len; } lens;
 };
 extern struct cam_state cam;
+extern int gui_state;                       /* ML's copy of Canon's GUI state: 0 = idle */
+int module_send_keypress(int module_key);
 
 #define lv            (cam.lv_on)
 #define lv_dispsize   (cam.dispsize)

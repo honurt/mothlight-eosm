@@ -33,6 +33,8 @@
 /* ---------------------------------------------------------------- world */
 
 struct cam_state cam;
+int gui_state;
+static int raw_recordings, h264_recordings;
 static uint32_t now_ms;
 static uint8_t * bmp;                       /* 960 x 480, like the EOS M's BMP VRAM */
 struct font font_dynamic[UF_COUNT];
@@ -254,8 +256,8 @@ static void canon_receive(int code)
     if (!cam.lv_on || cam.playback) return;
     switch (code)
     {
-        case 0x1E:  /* movie button */
-            if (cam.movie) cam.recording = !cam.recording;
+        case 0x1E:  /* movie button: Canon's own H.264 */
+            if (cam.movie) { cam.recording = !cam.recording; cam.raw = 0; if (cam.recording) h264_recordings++; }
             break;
         case 0x0B:  /* PLAY */
             cam.playback = 1; cam.lv_on = 0;
@@ -288,7 +290,15 @@ enum {
     K_PLAY = 0x0B, K_REC = 0x1E, K_UP = 0x2a, K_UP_UP = 0x2b, K_RIGHT = 0x26, K_RIGHT_UP = 0x27,
     K_LEFT = 0x28, K_LEFT_UP = 0x29, K_DOWN = 0x2c, K_DOWN_UP = 0x2d, K_HALF = 0x50,
     K_TOUCH = 0x6f, K_UNTOUCH = 0x70, K_TOUCH2 = 0x76, K_DOOR = 93, K_OLC = 105, K_UNHANDLED = 0x54,
+    K_QSET = 0x1d,
 };
+
+static int canon_code(int portable_key)
+{
+    for (int i = 0; i < COUNT(eosm_keys); i++)
+        if (eosm_keys[i].portable == portable_key) return eosm_keys[i].canon;
+    return -1;
+}
 
 static int portable(int canon)
 {
@@ -300,8 +310,17 @@ static int portable(int canon)
 /* one button event through ML: core first (two-finger tap opens ML's menu), then modules */
 static void gui_event_x(int canon, int fake)
 {
-    if (canon == K_TOUCH2 && cam.lv_on && !cam.menu_shown) { cam.menu_shown = 1; return; }
+    /* ML core: two-finger tap opens ML's menu, but only from idle LiveView (handle_ml_menu_erase) */
+    if (canon == K_TOUCH2 && cam.lv_on && !cam.menu_shown && gui_state == 0) { cam.menu_shown = 1; return; }
     if (cam.menu_shown) return;             /* ML's menu eats everything while it is open */
+
+    /* MLV Lite (loaded before moth_ui): takes REC only in idle LiveView, with RAW video on */
+    if (canon == K_REC && cam.lv_on && cam.movie && gui_state == 0 && menu_val("Movie", "RAW video") == 1)
+    {
+        cam.recording = !cam.recording; cam.raw = 1;
+        if (cam.recording) raw_recordings++;
+        return;
+    }
 
     static struct event ev;                 /* static: low address, like the camera's 32-bit pointers */
     ev.type = 0; ev.param = canon; ev.obj = 0; ev.arg = fake ? FAKE_BTN : 0;
@@ -320,7 +339,7 @@ static int ml_longpress_down = 1;
 static int ml_redraws;
 static void press_down_eosm(int hold_ms)
 {
-    if (!ml_longpress_down || !cam.lv_on || cam.menu_shown || cam.playback)
+    if (!ml_longpress_down || !cam.lv_on || cam.menu_shown || cam.playback || gui_state != 0)
     {
         gui_event(K_DOWN); run_for(hold_ms); gui_event(K_DOWN_UP); return;
     }
@@ -347,6 +366,12 @@ static void press_down_eosm(int hold_ms)
        and the release (0x27) arrive */
 static void press_set_eosm(int hold_ms)
 {
+    if (gui_state != 0)
+    {
+        /* LiveView not idle for ML: no long-press check, SET arrives as its real code */
+        gui_event(K_QSET); gui_event(K_UNHANDLED); run_for(hold_ms); gui_event(K_SET_UP);
+        return;
+    }
     run_for(hold_ms);
     gui_event(K_SET_UP);                    /* the real release arrives first ... */
     gui_event(K_UNHANDLED);
@@ -379,9 +404,24 @@ static void tap(int canon, int hold_ms)
 
 /* ---------------------------------------------------------------- world ticking */
 
+static int sent_q[16], sent_n;
+int module_send_keypress(int module_key)
+{
+    int c = canon_code(module_key);
+    if (c >= 0 && sent_n < 16) sent_q[sent_n++] = c;
+    return 0;
+}
+
 static uint32_t lv_back_at, last_periodic;
 static void world_tick(void)
 {
+    /* keys a module sent with module_send_keypress arrive as fake events, after the current one */
+    while (sent_n)
+    {
+        int c = sent_q[0];
+        memmove(sent_q, sent_q + 1, --sent_n * sizeof(int));
+        gui_event_x(c, 1);
+    }
     if (lv_back_at && now_ms >= lv_back_at)
     {
         cam.lv_on = 1; lv_back_at = 0;
@@ -559,6 +599,8 @@ static void post_frame_checks(void)
     }
     if (getenv("TRACE2") && now_ms > (uint32_t)atoi(getenv("TRACE2"))) fprintf(stderr, "    f @%u ov %d st %d half %d lv %d movie %d menu %d disp %d apply %d ring %d/%d bp %d\n", now_ms, overlay_active, panel.state, tween_value(&panel.reveal, now_ms), cam.lv_on, cam.movie, cam.menu_shown, cam.display_on, apply_phase, key_head, key_tail, begin_pending);
     if (overlay_active) begin_pending = 0;
+    if (!overlay_active && !begin_pending && gui_state == MOTH_GUI_STATE)
+        FAIL("ML's gui_state left at Mothlight's value with the panel closed");
     if (was_overlay && !overlay_active && !begin_pending)
     {
         /* the panel just handed the screen back */
@@ -661,14 +703,19 @@ static void s_down_eosm(void)
     boot(); open_panel();
     int s0 = panel.sel;
     for (int i = 0; i < 5; i++) { tap(K_DOWN, 60 + i * 40); run_for(150); }
-    EXPECT(ml_redraws == 5, "ML's long-press check ran %d times", ml_redraws);
-    EXPECT(panel.sel == (s0 + 5) % profile_count, "DOWN x5 (through ML's long-press check) moved %d -> %d", s0, panel.sel);
+    EXPECT(ml_redraws == 0, "ML's long-press check ran %d times with the panel open (the black flash)", ml_redraws);
+    EXPECT(panel.sel == (s0 + 5) % profile_count, "DOWN x5 moved %d -> %d", s0, panel.sel);
     EXPECT(panel_open_now(), "panel closed after DOWN");
     printf("    worst overdraw after DOWN: %d ms\n", worst_overdraw);
-    /* holding DOWN opens ML's menu: the panel must give way */
-    tap(K_DOWN, 700);
-    run_for(100);
-    EXPECT(!overlay_active, "panel still drawing over ML's menu after a long DOWN");
+    /* a long hold is just a long press of DOWN while the panel is open */
+    tap(K_DOWN, 700); run_for(100);
+    EXPECT(panel_open_now() && !cam.menu_shown, "a long DOWN left the panel");
+    close_panel();
+    /* with the panel closed, ML's long-press is back: a short DOWN redraws, a long one opens ML's menu */
+    tap(K_DOWN, 60); run_for(100);
+    EXPECT(ml_redraws == 1, "ML's long-press check did not come back after closing");
+    tap(K_DOWN, 700); run_for(100);
+    EXPECT(cam.menu_shown, "long DOWN with the panel closed did not open ML's menu");
     cam.menu_shown = 0;
     finish();
 }
@@ -730,7 +777,7 @@ static void s_event_log(void)
     EXPECT(logfile_writes == 1, "log written %d times", logfile_writes);
     run_for(3500);                          /* it keeps listening 3 s after closing, then writes */
     EXPECT(strstr(logfile, "OPEN") && strstr(logfile, "button 0x28") && strstr(logfile, "button 0x69")
-           && strstr(logfile, "(fake)") && strstr(logfile, "CLOSE closed by a key"), "log content:\n%s", logfile);
+           && strstr(logfile, "button 0x2c") && strstr(logfile, "CLOSE closed by a key"), "log content:\n%s", logfile);
     EXPECT(!strstr(logfile, "  u  "), "log times did not print");
     /* never written while recording */
     open_panel();
@@ -740,6 +787,55 @@ static void s_event_log(void)
     cam.recording = 0;
     run_for(3500);
     EXPECT(logfile_writes == 2 && strstr(logfile, "CLOSE closed by REC/PLAY/shutter"), "log after REC:\n%s", logfile);
+    finish();
+}
+
+static void s_gui_state(void)
+{
+    boot(); open_panel();
+    EXPECT(gui_state == MOTH_GUI_STATE, "gui_state not held while open (%d)", gui_state);
+    int r0 = ml_redraws, s0 = panel.sel;
+    for (int i = 0; i < 4; i++) { tap(K_DOWN, 80); run_for(120); }
+    EXPECT(ml_redraws == r0, "ML's long-press check still ran on DOWN (%d redraws)", ml_redraws - r0);
+    EXPECT(panel.sel == (s0 + 4) % profile_count, "DOWN x4 with the state held: sel %d -> %d", s0, panel.sel);
+    select_profile(find_profile(MOOD_1X1));
+    tap(K_SET, 60); run_for(2000);
+    EXPECT(ml_redraws == r0, "ML's long-press check ran on SET");
+    EXPECT(cfg_active == find_profile(MOOD_1X1), "SET (real 0x1d) did not apply (active %d)", cfg_active);
+    run_for(3000);
+    EXPECT(!overlay_active && gui_state == 0, "after closing: overlay %d, gui_state %d", overlay_active, gui_state);
+    /* Canon changes state while the panel is up: our close must not overwrite it */
+    open_panel();
+    gui_state = 2;
+    close_panel();
+    EXPECT(gui_state == 2, "closing overwrote a state Canon set meanwhile (%d)", gui_state);
+    gui_state = 0;
+    finish();
+}
+
+static void s_rec_raw_while_open(void)
+{
+    boot(); open_panel();
+    select_profile(find_profile(MOOD_1X1));
+    tap(K_SET, 40); run_for(1200);          /* RAW video on */
+    tap(K_DOWN, 40); run_for(200);          /* keep the panel open */
+    EXPECT(panel_open_now(), "panel not open");
+    tap(K_REC, 0); run_for(400);
+    EXPECT(raw_recordings == 1 && h264_recordings == 0, "REC with the panel open: %d RAW, %d H.264 recordings",
+           raw_recordings, h264_recordings);
+    EXPECT(!overlay_active, "panel still up while recording");
+    cam.recording = 0;
+    run_for(3500);
+    finish();
+}
+
+static void s_two_finger_while_open(void)
+{
+    boot(); open_panel();
+    tap(K_TOUCH2, 0); run_for(200);
+    EXPECT(!overlay_active, "panel still up after a two-finger tap");
+    EXPECT(cam.menu_shown, "two-finger tap with the panel open did not open ML's menu");
+    cam.menu_shown = 0;
     finish();
 }
 
@@ -826,6 +922,7 @@ static void s_menu_while_open(void)
     tap(K_TOUCH2, 0);                       /* two-finger tap: ML's menu */
     run_for(100);
     EXPECT(!overlay_active, "panel still drawing over ML's menu 100 ms after it opened");
+    EXPECT(cam.menu_shown, "ML's menu did not open");
     cam.menu_shown = 0;
     finish();
 }
@@ -1256,11 +1353,14 @@ struct sc { const char * name; void (*fn)(void); };
 static const struct sc all[] = {
     { "basic navigation (no flash, no leak)", s_basic_navigation },
     { "double INFO during start-up (no ghost reopen)", s_double_info },
-    { "DOWN through ML's EOS M long-press check (flash, long hold)", s_down_eosm },
+    { "DOWN with the panel open never reaches ML's long-press (no flash)", s_down_eosm },
     { "apply without visible flash (helper task)", s_apply_no_flash },
     { "close while applying, then apply again", s_close_mid_apply },
     { "SD Overclock hint when the card is the limit", s_sd_clock_hint },
     { "event log on the card (never while recording)", s_event_log },
+    { "ML's gui_state held while open: no long-press flash on DOWN/SET", s_gui_state },
+    { "REC with the panel open starts RAW (MLV Lite), not H.264", s_rec_raw_while_open },
+    { "two-finger tap with the panel open: close and open ML's menu", s_two_finger_while_open },
     { "all themes, both directions", s_themes_all },
     { "600 random keys incl. touch and unknown events", s_key_mash },
     { "keys during open/close animations", s_keys_during_animations },
