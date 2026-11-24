@@ -69,9 +69,12 @@ in the release notes.
 
 ### Focus in Crop Mood presets (AF lens)
 
-- [ ] Tap the picture: x10 at that spot within ~1 s, Canon's own focus box, it focuses, ~1 s later back to x5
-- [ ] The framing after it is the same as before (nothing shifted)
-- [ ] Half-press: x10 and focus while held; release: back to x5
+- [ ] A white focus box in the middle of the picture, like Canon's
+- [ ] Tap a spot: the box jumps there, focuses there (no zoom), turns green (red if it can't)
+- [ ] Is the box where you tapped, and does the focus land on that subject? (send MOTHLOG.TXT if not)
+- [ ] Half-press: Canon focuses at the box, the box turns green; no grey ML preview flash
+- [ ] The quick bar hides the box; closing the bar brings it back
+- [ ] Settings > Tap to focus > Precise (x10): tap / half-press go to x10 and back, as in 0.4.0
 - [ ] No ML overlay flash on half-press; no Canon icons flashing after closing the bar in x5
 - [ ] REC while at x10: back to x5 first, then RAW records
 - [ ] MF lens / H.264 profile: tap and half-press behave as Canon's
@@ -80,7 +83,18 @@ in the release notes.
 
 ### Recording preview
 
-- [ ] Settings > Screen while recording RAW: "ML framing" removes the vertical lines on screen (clip unaffected)
+- [ ] While recording a RAW profile the screen shows the whole recorded frame (grey), not a tighter view
+- [ ] No vertical lines on screen while recording
+- [ ] Settings > Screen while recording RAW > Canon (live) still possible, and kept after re-applying
+
+### Clips (PLAY, with RAW on)
+
+- [ ] PLAY opens the clip list at once (no "Building index"); newest first with length and size
+- [ ] A clip: Play starts ML's player on that clip; while it says "Preparing", any button cancels
+- [ ] Delete asks first ("Keep it" selected); Delete removes the clip (and its .M00 parts)
+- [ ] INFO goes back one step; PLAY on the list goes back to LiveView
+- [ ] Canon playback shows photos / H.264
+- [ ] The welcome page does not come back after a restart, even after pulling the battery
 
 ### Magic Lantern's menu (two-finger tap)
 

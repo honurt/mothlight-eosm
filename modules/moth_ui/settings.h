@@ -49,6 +49,7 @@ struct settings_view
     int battery_bars;       /* 0 low, 1 half, 2+ full; -1 unknown */
     int warn_count;
     char title[24];         /* header; empty: "Settings" */
+    const char * set_word;  /* what SET does here, for the hint bar; 0: "Change" */
 };
 
 enum settings_act { SA_NONE, SA_ACTIVATE, SA_CLOSE };

@@ -17,6 +17,7 @@ struct cam_state
     int disp_mode;                               /* Canon's INFO display mode (lv_disp_mode) */                                 /* PROP_BATTERY_POWER: 0 low, 1 half, 2 full */
     int playback, canon_menu;
     int manual_focus;                            /* the lens (or its switch) is on MF */
+    int half;                                    /* half-shutter held (ML's get_halfshutter_pressed) */
     struct {
         int focal_len, lens_exists;
         int raw_shutter, raw_aperture, raw_aperture_min, raw_aperture_max, raw_iso, aperture;
@@ -35,11 +36,13 @@ int module_send_keypress(int module_key);
 #define RECORDING_RAW (cam.recording && cam.raw)
 #define lens_info     (cam.lens)
 
+#define COERCE(x,lo,hi) ((x) < (lo) ? (lo) : (x) > (hi) ? (hi) : (x))
 #define COUNT(x)   ((int)(sizeof(x)/sizeof((x)[0])))
 #define ABS(x)     ((x) < 0 ? -(x) : (x))
 #define streq(a,b) (strcmp((a),(b)) == 0)
 #define BMPPITCH   960
 #define COLOR_EMPTY    0x00
+#define COLOR_WHITE    0x01
 #define COLOR_RED      0x08
 #define COLOR_DARK_RED 0x09
 #define COLOR_GREEN1   0x06
@@ -53,6 +56,7 @@ void get_afframe_pos(int W, int H, int * x, int * y);
 void get_afframe_sensor_res(int * W, int * H);
 void move_lv_afframe(int dx, int dy);
 void SW1(int v, int wait);
+int get_halfshutter_pressed(void);
 int  fps_get_current_x1000(void);
 
 struct menu_display_info { char value[64]; char help[160]; char warning[96]; };
@@ -75,7 +79,7 @@ void   cam_free(void * p);
 #define free   cam_free
 
 const char * get_dcim_dir(void);
-struct fio_file { int mode; uint32_t timestamp; char name[64]; };
+struct fio_file { int mode; uint32_t timestamp; uint32_t size; char name[64]; };
 struct fio_dirent { int i; };
 #define ATTR_DIRECTORY 0x10
 #define IS_ERROR(p) (!(p))
@@ -124,6 +128,15 @@ uint32_t camsim_peek32(uint32_t addr);
 #define IS_FAKE(event) ((event)->arg == FAKE_BTN)
 
 FILE * FIO_CreateFile(const char * name);
+FILE * FIO_OpenFile(const char * name, unsigned mode);
+int  FIO_ReadFile(FILE * f, void * p, size_t n);
+int  FIO_SeekSkipFile(FILE * f, int pos, int whence);
+int  FIO_RemoveFile(const char * name);
+#define O_RDONLY 0
+#define O_SYNC   0
+#ifndef SEEK_SET
+#define SEEK_SET 0
+#endif
 int  FIO_WriteFile(FILE * f, const void * p, size_t n);
 void FIO_CloseFile(FILE * f);
 

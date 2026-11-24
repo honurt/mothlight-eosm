@@ -334,7 +334,7 @@ static void render_hint(struct settings * s, const struct settings_view * v, str
     {
         int x = 16;
         uint8_t fg = bar_text(v);
-        x += keycap(v, c, x, y, "SET", 0) + 6;   x += ui_text(c, UF_SMALL, x, y + 5, fg, UA_LEFT, "Change") + 22;
+        x += keycap(v, c, x, y, "SET", 0) + 6;   x += ui_text(c, UF_SMALL, x, y + 5, fg, UA_LEFT, v->set_word ? v->set_word : "Change") + 22;
         x += keycap(v, c, x, y, "", 1) + 6;      x += ui_text(c, UF_SMALL, x, y + 5, fg, UA_LEFT, "Choose") + 22;
         x += keycap(v, c, x, y, "INFO", 0) + 6;  ui_text(c, UF_SMALL, x, y + 5, fg, UA_LEFT, "Back");
         ui_text(c, UF_SMALL, SW - 16, y + 5, bar_dim(v), UA_RIGHT, "Full ML menu: two-finger tap");

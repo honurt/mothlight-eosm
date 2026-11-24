@@ -3,7 +3,8 @@ by Onur  -  https://github.com/honurt/mothlight-eosm
 
 In movie mode:
   INFO            the quick bar (shutter, aperture, ISO, WB, focus, profile)
-  Tap / half-press  focus there at x10 in Crop Mood presets, then back
+  Tap the picture   the focus box moves there and focuses (Crop Mood presets)
+  PLAY              your clips: play, delete; Canon playback from there
   PROFILE tile    recording profiles
   Two-finger tap  the menu: the Mothlight tab comes first (Settings, Profiles, Theme ...)
 

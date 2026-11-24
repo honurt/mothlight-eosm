@@ -25,7 +25,8 @@ THEN
 
    INFO ............ quick bar: shutter, aperture, ISO, WB, focus, profile
    SET ............. next tile        UP / DOWN ..... change the value
-   Tap the picture . focus there (Crop Mood presets: at x10, then back)
+   Tap the picture . the focus box moves there and focuses
+   PLAY ............ your clips (play, delete); Canon playback from there
    Two-finger tap .. the menu; its first tab is Mothlight (Settings first)
 
 GOOD TO KNOW

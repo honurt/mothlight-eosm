@@ -35,6 +35,8 @@
 struct cam_state cam;
 int gui_state;
 static int raw_recordings, h264_recordings, rec_at_x10;
+static char mlv_played[128];
+static int mlv_play_runs;
 static const int shutters[] = { 33, 40, 50, 60, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000 };
 static const int fstops10[] = { 14, 16, 18, 20, 22, 25, 28, 32, 35, 40, 45, 50, 56, 63, 71, 80, 90, 100, 110, 130, 140, 160, 180, 200, 220 };
 static const int isos[] = { 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400 };
@@ -87,6 +89,7 @@ static struct mval menus[] = {
     { "RAW video", "Sound recording", 0, 1 },
     { "RAW video", "Small hacks", 1, 1 },
     { "RAW video", "Preview", 1, 1 },
+    { "RAW video", "Preview toggle", 1, 1 },
     { "Overlay", "Zebras", 0, 1 },
     { "Overlay", "Focus Peak", 0, 1 },
     { "Overlay", "False color", 0, 1 },
@@ -245,11 +248,26 @@ static void check_visible(void)
 static char logfile[65536];
 static int logfile_len, logfile_writes, logfile_writes_recording;
 static struct { int open, profiles; } the_file;
+static int welcome_marker_on_card;
+static struct { int open, idx, pos; } reader;
+static char play_req[128];
+static int play_req_len;
 static char profiles_written[16384];        /* PROFILES.TXT as the module wrote it */
 static int profiles_written_len, profiles_writes, fail_profiles_write;
 static const char * profiles_txt;           /* NULL: no PROFILES.TXT on the card */
 FILE * FIO_CreateFile(const char * name)
 {
+    if (!strcmp(name, "ML/SETTINGS/MOTHPLAY.REQ"))
+    {
+        play_req_len = 0; play_req[0] = 0; the_file.profiles = 3;
+        return (FILE *) &the_file;
+    }
+    if (!strcmp(name, "ML/SETTINGS/MOTHWEL.TXT"))
+    {
+        if (cam.recording) FAIL("welcome marker written while recording");
+        welcome_marker_on_card = 1; the_file.profiles = 2;
+        return (FILE *) &the_file;
+    }
     if (!strcmp(name, "ML/SETTINGS/PROFILES.TXT"))
     {
         if (cam.recording) FAIL("PROFILES.TXT written while recording");
@@ -267,6 +285,13 @@ FILE * FIO_CreateFile(const char * name)
 }
 int FIO_WriteFile(FILE * f, const void * p, size_t n)
 {
+    if (the_file.profiles == 2) return n;
+    if (the_file.profiles == 3)
+    {
+        if (n > sizeof(play_req) - 1 - play_req_len) n = sizeof(play_req) - 1 - play_req_len;
+        memcpy(play_req + play_req_len, p, n); play_req_len += n; play_req[play_req_len] = 0;
+        return n;
+    }
     if (the_file.profiles)
     {
         if (n > sizeof(profiles_written) - 1 - profiles_written_len) n = sizeof(profiles_written) - 1 - profiles_written_len;
@@ -278,7 +303,7 @@ int FIO_WriteFile(FILE * f, const void * p, size_t n)
     memcpy(logfile + logfile_len, p, n); logfile_len += n; logfile[logfile_len < (int)sizeof(logfile) ? logfile_len : (int)sizeof(logfile) - 1] = 0;
     return n;
 }
-void FIO_CloseFile(FILE * f) { if (the_file.profiles) profiles_txt = profiles_written; the_file.open = 0; the_file.profiles = 0; }
+void FIO_CloseFile(FILE * f) { if (f == (FILE *) &reader) { reader.open = 0; return; } if (the_file.profiles == 1) profiles_txt = profiles_written; the_file.open = 0; the_file.profiles = 0; }
 
 /* ---------------------------------------------------------------- Canon */
 
@@ -292,7 +317,8 @@ static void canon_redraw_screen(void)
     if (overlay_active) canon_redraws_open++;
 }
 
-static int canon_af_in_x5, canon_moved_window;   /* what Crop Mood users suffer without Mothlight */
+static int canon_af_in_x5, canon_moved_window;
+static uint32_t sw1_since;   /* what Crop Mood users suffer without Mothlight */
 static int crop_mood_x5_idle(void);
 static void canon_receive(int code)
 {
@@ -360,9 +386,25 @@ static int portable(int canon)
 /* one button event through ML: core first (two-finger tap opens ML's menu), then modules */
 static void gui_event_x(int canon, int fake)
 {
+    if (canon == 0x50 && !fake) { cam.half = 1; sw1_since = now_ms; }
+    if (canon == 0x51 && !fake) cam.half = 0;
     /* ML core: two-finger tap opens ML's menu, but only from idle LiveView (handle_ml_menu_erase) */
     if (canon == K_TOUCH2 && cam.lv_on && !cam.menu_shown && gui_state == 0) { cam.menu_shown = 1; return; }
     if (cam.menu_shown) return;             /* ML's menu eats everything while it is open */
+
+    /* MLV Play (patched, loaded before moth_ui): PLAY in idle movie LiveView with RAW on */
+    if (canon == K_PLAY && cam.lv_on && cam.movie && gui_state == 0 && menu_val("Movie", "RAW video") == 1)
+    {
+        if (play_req_len)
+        {
+            char * nl = strchr(play_req, '\n'); if (nl) *nl = 0;
+            snprintf(mlv_played, sizeof(mlv_played), "%s", play_req);
+            play_req_len = 0; mlv_play_runs++;
+            return;
+        }
+        if (!cfg_clips) { mlv_played[0] = 0; mlv_play_runs++; return; }
+        /* Mothlight's clip list: go on to the modules */
+    }
 
     /* MLV Lite (loaded before moth_ui): takes REC only in idle LiveView, with RAW video on */
     if (canon == K_REC && cam.lv_on && cam.movie && gui_state == 0 && menu_val("Movie", "RAW video") == 1)
@@ -546,7 +588,6 @@ int fps_get_current_x1000(void) { return 23976; }
 #define AF_H 3456
 static int af_cx = AF_W / 2, af_cy = AF_H / 2, af_moves, af_moves_rec;
 static int sw1_on, af_runs, af_at_x10, af_at_x5;
-static uint32_t sw1_since;
 static int af_never_confirms;
 static int crop_mood_x5_idle(void) { return menu_val("Movie", "Crop mood") > 0 && cam.dispsize == 5 && !cam.recording && cam.lv_on; }
 void get_afframe_sensor_res(int * W, int * H) { if (W) *W = AF_W; if (H) *H = AF_H; }
@@ -567,7 +608,8 @@ void SW1(int v, int wait)
     cam_block(wait);
 }
 int is_manual_focus(void) { return cam.manual_focus; }
-int get_focus_confirmation(void) { return sw1_on && !af_never_confirms && now_ms - sw1_since > 400; }
+int get_halfshutter_pressed(void) { return cam.half || sw1_on; }
+int get_focus_confirmation(void) { return (sw1_on || cam.half) && !af_never_confirms && now_ms - sw1_since > 400; }
 void gui_stop_menu(void) { cam.menu_shown = 0; }
 
 int menu_get_value_from_script(const char * m, const char * e)
@@ -685,7 +727,7 @@ void cam_free(void * q)
 }
 
 /* the card: a DCIM folder with whatever MLV files the scenario puts there */
-struct fake_file { char name[64]; uint32_t size, ts; };
+struct fake_file { char name[64]; uint32_t size, ts; int frames, w, h, audio; };
 static struct fake_file dcim[16];
 static int dcim_n;
 const char * get_dcim_dir(void) { return "B:/DCIM/100CANON/"; }
@@ -694,18 +736,66 @@ struct fio_dirent * FIO_FindFirstEx(const char * dir, struct fio_file * f)
 {
     if (!dcim_n) return 0;
     the_dirent.i = 0;
-    snprintf(f->name, sizeof(f->name), "%s", dcim[0].name); f->mode = 0; f->timestamp = dcim[0].ts;
+    snprintf(f->name, sizeof(f->name), "%s", dcim[0].name); f->mode = 0; f->timestamp = dcim[0].ts; f->size = dcim[0].size;
     return &the_dirent;
 }
 int FIO_FindNextEx(struct fio_dirent * d, struct fio_file * f)
 {
     if (++d->i >= dcim_n) return 1;
-    snprintf(f->name, sizeof(f->name), "%s", dcim[d->i].name); f->mode = 0; f->timestamp = dcim[d->i].ts;
+    snprintf(f->name, sizeof(f->name), "%s", dcim[d->i].name); f->mode = 0; f->timestamp = dcim[d->i].ts; f->size = dcim[d->i].size;
     return 0;
 }
 void FIO_FindClose(struct fio_dirent * d) {}
+/* reading clip headers: a made-up MLVI + RAWI for each .MLV in the folder */
+static uint8_t mlv_hdr[256];
+static void make_mlv_header(const struct fake_file * c)
+{
+    memset(mlv_hdr, 0, sizeof(mlv_hdr));
+    uint8_t * p = mlv_hdr;
+    #define W32(o, v) do { uint32_t _v = (v); p[o] = _v; p[o+1] = _v >> 8; p[o+2] = _v >> 16; p[o+3] = _v >> 24; } while (0)
+    #define W16(o, v) do { uint32_t _v = (v); p[o] = _v; p[o+1] = _v >> 8; } while (0)
+    memcpy(p, "MLVI", 4); W32(4, 52); memcpy(p + 8, "v2.0", 4);
+    W16(32, 0x21); W16(34, c->audio ? 1 : 0); W32(36, c->frames); W32(44, 23976); W32(48, 1000);
+    p += 52;
+    memcpy(p, "RAWI", 4); W32(4, 180); W16(16, c->w); W16(18, c->h);
+    #undef W32
+    #undef W16
+}
+FILE * FIO_OpenFile(const char * name, unsigned mode)
+{
+    const char * base = strrchr(name, '/'); base = base ? base + 1 : name;
+    for (int i = 0; i < dcim_n; i++)
+        if (!strcmp(dcim[i].name, base)) { reader.open = 1; reader.idx = i; reader.pos = 0; make_mlv_header(&dcim[i]); return (FILE *) &reader; }
+    return 0;
+}
+int FIO_SeekSkipFile(FILE * f, int pos, int whence) { reader.pos = pos; return pos; }
+int FIO_ReadFile(FILE * f, void * p, size_t n)
+{
+    if (reader.pos >= (int)sizeof(mlv_hdr)) return 0;
+    if (n > sizeof(mlv_hdr) - reader.pos) n = sizeof(mlv_hdr) - reader.pos;
+    memcpy(p, mlv_hdr + reader.pos, n); reader.pos += n;
+    return n;
+}
+static char removed[256];
+static int removals;
+int FIO_RemoveFile(const char * name)
+{
+    if (cam.recording) FAIL("a file was deleted while recording");
+    const char * base = strrchr(name, '/'); base = base ? base + 1 : name;
+    for (int i = 0; i < dcim_n; i++)
+        if (!strcmp(dcim[i].name, base))
+        {
+            strncat(removed, base, sizeof(removed) - strlen(removed) - 2); strcat(removed, " ");
+            dcim[i] = dcim[--dcim_n]; removals++;
+            return 0;
+        }
+    return -1;
+}
+
 int FIO_GetFileSize(const char * path, uint32_t * size)
 {
+    if (!strcmp(path, "ML/SETTINGS/MOTHWEL.TXT")) { *size = 70; return welcome_marker_on_card ? 0 : -1; }
+    if (!strcmp(path, "ML/SETTINGS/MOTHPLAY.REQ")) { *size = play_req_len; return play_req_len ? 0 : -1; }
     const char * base = strrchr(path, '/');
     base = base ? base + 1 : path;
     for (int i = 0; i < dcim_n; i++)
@@ -1801,7 +1891,7 @@ static void s_settings_ml_items(void)
     EXPECT(menu_val("RAW video", "Sound recording") == 1, "Sound not switched on");
     settings_set(SI_SOUND);
     settings_set(SI_PREVIEW);
-    EXPECT(menu_val("RAW video", "Preview") == 2 && screen_says("ML framing"), "preview setting: %d", menu_val("RAW video", "Preview"));
+    EXPECT(menu_val("RAW video", "Preview") == 2 && screen_says("Exact framing"), "preview setting: %d", menu_val("RAW video", "Preview"));
     settings_set(SI_HACKS);
     EXPECT(menu_val("RAW video", "Small hacks") == 2, "Small hacks: %d", menu_val("RAW video", "Small hacks"));
     settings_set(SI_ZEBRAS);
@@ -2019,6 +2109,8 @@ static void s_welcome(void)
     settings_goto(SI_WELCOME_DONE);
     tap(K_SET, 30); run_for(600);
     EXPECT(!overlay_active && cfg_welcomed, "Start shooting did not close the welcome (overlay %d)", overlay_active);
+    run_for(300);
+    EXPECT(welcome_marker_on_card, "the welcome's marker file was not written (a battery pull would bring it back)");
     run_for(6000);
     EXPECT(!overlay_active, "the welcome came back");
     /* from Settings > About it shows again, and back returns to Settings */
@@ -2028,6 +2120,46 @@ static void s_welcome(void)
     tap(K_INFO, 0); run_for(400);
     EXPECT(overlay_active && ov_mode == OV_SETTINGS && !welcome_mode && sel_id() == SI_WELCOME, "back from the welcome: mode %d welcome %d on %d",
            ov_mode, welcome_mode, sel_id());
+    finish();
+}
+
+static void s_recording_preview_defaults(void)
+{
+    boot();
+    EXPECT(menu_val("RAW video", "Preview toggle") == 1, "(setup) toggle starts on");
+    open_panel(); select_profile(find_profile(MOOD_1X1)); tap(K_SET, 40); run_for(4000);
+    if (overlay_active) close_panel();
+    EXPECT(menu_val("RAW video", "Preview toggle") == 0, "MLV Lite still swaps the preview on half-press");
+    EXPECT(menu_val("RAW video", "Preview") == 2, "recording preview not set to exact framing (%d)", menu_val("RAW video", "Preview"));
+    /* the user's own choice afterwards is kept on the next apply */
+    open_settings(); settings_set(SI_PREVIEW); settings_set(SI_PREVIEW);
+    int chosen = menu_val("RAW video", "Preview");
+    close_panel();
+    open_panel(); select_profile(find_profile(MOOD_3X3)); tap(K_SET, 40); run_for(4000);
+    if (overlay_active) close_panel();
+    EXPECT(menu_val("RAW video", "Preview") == chosen, "applying overrode the user's preview choice (%d -> %d)", chosen, menu_val("RAW video", "Preview"));
+    /* RAW already on at start-up: fixed without applying */
+    finish();
+}
+
+static void s_recording_preview_at_boot(void)
+{
+    find_menu("Movie", "RAW video")->value = 1;
+    boot();
+    run_for(4000);
+    EXPECT(menu_val("RAW video", "Preview toggle") == 0 && menu_val("RAW video", "Preview") == 2, "start-up with RAW on: toggle %d preview %d",
+           menu_val("RAW video", "Preview toggle"), menu_val("RAW video", "Preview"));
+    finish();
+}
+
+static void s_welcome_after_battery_pull(void)
+{
+    /* seen before, but the camera was not switched off cleanly: ML never saved moth.welcomed */
+    welcome_marker_on_card = 1;
+    want_welcome = 1;
+    boot();
+    run_for(8000);
+    EXPECT(!overlay_active && cfg_welcomed, "the welcome came back after a battery pull");
     finish();
 }
 
@@ -2062,7 +2194,7 @@ static void crop_preset_on(void)
 
 static void s_focus_half_press(void)
 {
-    boot(); crop_preset_on();
+    boot(); cfg_focus = FOCUS_X10; crop_preset_on();
     gui_event(K_HALF); run_for(1600);
     EXPECT(cam.dispsize == 10 && fj_state == FJ_HOLD, "half-press did not go to x10 (zoom %d, job %d)", cam.dispsize, fj_state);
     EXPECT(af_at_x10 == 1 && af_at_x5 == 0 && canon_af_in_x5 == 0, "AF ran %d at x10, %d at x5, Canon %d at x5", af_at_x10, af_at_x5, canon_af_in_x5);
@@ -2080,7 +2212,7 @@ static void s_focus_half_press(void)
 
 static void s_focus_tap(void)
 {
-    boot(); crop_preset_on();
+    boot(); cfg_focus = FOCUS_X10; crop_preset_on();
     touch_raw = 0xffffffff;
     touch_at(600, 140);                     /* top-right of the picture */
     run_for(900);
@@ -2133,7 +2265,7 @@ static void s_focus_leaves_alone(void)
 
 static void s_focus_keys_meanwhile(void)
 {
-    boot(); crop_preset_on();
+    boot(); cfg_focus = FOCUS_X10; crop_preset_on();
     menu_set_value_from_script("Movie", "RAW video", 1);
     /* REC while looking at x10: back to x5 first, then RAW */
     touch_at(360, 240); run_for(1000);
@@ -2155,6 +2287,181 @@ static void s_focus_keys_meanwhile(void)
     run_for(2500);
     cam.menu_shown = 0; run_for(2000);
     EXPECT(fj_state == FJ_IDLE && cam.dispsize == 5, "lost release left x10 (job %d zoom %d)", fj_state, cam.dispsize);
+    finish();
+}
+
+static int box_pixels(int cx, int cy, uint8_t color)
+{
+    /* how many pixels of a focus-box outline centred at (cx, cy) have this colour */
+    int n = 0, x0 = cx - FB_W / 2, y0 = cy - FB_H / 2;
+    for (int i = 0; i < FB_W; i++) { n += bmp[y0 * BMPPITCH + x0 + i] == color; n += bmp[(y0 + FB_H - 1) * BMPPITCH + x0 + i] == color; }
+    for (int i = 0; i < FB_H; i++) { n += bmp[(y0 + i) * BMPPITCH + x0] == color; n += bmp[(y0 + i) * BMPPITCH + x0 + FB_W - 1] == color; }
+    return n;
+}
+
+static void s_focus_box(void)
+{
+    boot(); crop_preset_on();
+    EXPECT(cfg_focus == FOCUS_BOX, "focus box is not the default (%d)", cfg_focus);
+    run_for(400);
+    EXPECT(box_pixels(UI_W / 2, UI_H / 2, COLOR_WHITE) > 200, "no white focus box in the middle (%d px)", box_pixels(UI_W / 2, UI_H / 2, COLOR_WHITE));
+    /* tap: the box moves there, focuses in place (no zoom), turns green */
+    int zooms_before = cam.dispsize;
+    touch_at(560, 150); run_for(700);
+    int bx, by;
+    EXPECT(afframe_to_screen(&bx, &by) && ABS(bx - 560) < 12 && ABS(by - 150) < 12, "AF point not where tapped (%d,%d)", bx, by);
+    EXPECT(cam.dispsize == zooms_before && af_at_x10 == 0 && af_at_x5 == 1, "box mode zoomed (zoom %d, AF x10 %d x5 %d)", cam.dispsize, af_at_x10, af_at_x5);
+    EXPECT(ABS(fb_drawn.x - 560) < 12 && ABS(fb_drawn.y - 150) < 12, "box drawn at %d,%d, tapped 560,150", fb_drawn.x, fb_drawn.y);
+    EXPECT(box_pixels(fb_drawn.x, fb_drawn.y, COLOR_GREEN1) > 200, "box not green at the tapped spot after focusing");
+    EXPECT(box_pixels(UI_W / 2, UI_H / 2, COLOR_WHITE) < 20, "old box left behind in the middle");
+    EXPECT(canon_moved_window == 0 && !sw1_on, "tap reached Canon, or the half-shutter switch was left on");
+    run_for(2000);
+    EXPECT(box_pixels(fb_drawn.x, fb_drawn.y, COLOR_WHITE) > 200, "box did not go back to white");
+    /* Crop Mood clears the screen: the box comes back */
+    memset(bmp, 0, BMPPITCH * 480); run_for(250);
+    EXPECT(box_pixels(fb_drawn.x, fb_drawn.y, COLOR_WHITE) > 200, "box not repaired after the screen was cleared");
+    /* half-press: Canon focuses at the box; it goes green, no zoom */
+    gui_event(K_HALF); run_for(700);
+    EXPECT(box_pixels(fb_drawn.x, fb_drawn.y, COLOR_GREEN1) > 200 && cam.dispsize == 5, "half-press: box not green, or zoomed");
+    gui_event(K_HALF_UP); run_for(300);
+    EXPECT(canon_af_in_x5 >= 1, "half-press did not reach Canon in box mode");
+    /* the quick bar hides it, closing brings it back */
+    int keep_x = fb_drawn.x, keep_y = fb_drawn.y;
+    cfg_key = 1; open_bar();
+    EXPECT(box_pixels(keep_x, keep_y, COLOR_WHITE) < 20, "box floats over the open bar");
+    close_panel(); run_for(400);
+    EXPECT(box_pixels(fb_drawn.x, fb_drawn.y, COLOR_WHITE) > 200, "box not back after closing the bar");
+    /* no focus: red, then white */
+    af_never_confirms = 1;
+    touch_at(200, 300); run_for(2400);
+    EXPECT(box_pixels(fb_drawn.x, fb_drawn.y, COLOR_RED) > 200, "failed focus not shown in red");
+    run_for(2000);
+    EXPECT(box_pixels(fb_drawn.x, fb_drawn.y, COLOR_WHITE) > 200, "red box did not return to white");
+    finish();
+}
+
+static void s_focus_box_not_shown(void)
+{
+    boot();
+    run_for(500);
+    EXPECT(box_pixels(UI_W / 2, UI_H / 2, COLOR_WHITE) < 20, "focus box drawn outside Crop Mood (Canon draws its own there)");
+    crop_preset_on();
+    cam.manual_focus = 1; run_for(400);
+    EXPECT(box_pixels(UI_W / 2, UI_H / 2, COLOR_WHITE) < 20, "focus box with a manual-focus lens");
+    cam.manual_focus = 0; cfg_focus = FOCUS_CANON; run_for(400);
+    EXPECT(box_pixels(UI_W / 2, UI_H / 2, COLOR_WHITE) < 20, "focus box with the setting off");
+    cfg_focus = FOCUS_BOX; run_for(400);
+    EXPECT(box_pixels(UI_W / 2, UI_H / 2, COLOR_WHITE) > 200, "focus box not back");
+    cam.menu_shown = 1; run_for(400);
+    EXPECT(box_pixels(UI_W / 2, UI_H / 2, COLOR_WHITE) < 20, "focus box over ML's menu");
+    cam.menu_shown = 0;
+    /* while recording: stays (Canon shows its box too), taps go to Crop Mood / Canon */
+    menu_set_value_from_script("Movie", "RAW video", 1);
+    tap(K_REC, 0); run_for(400);
+    int moves = af_moves;
+    touch_at(500, 200); run_for(400);
+    EXPECT(af_moves == moves && af_moves_rec == 0, "the box moved while recording");
+    cam.recording = 0; run_for(3500);
+    finish();
+}
+
+static void add_clip(const char * name, uint32_t MB, uint32_t ts, int frames, int w, int h, int audio)
+{
+    struct fake_file * f = &dcim[dcim_n++];
+    memset(f, 0, sizeof(*f));
+    snprintf(f->name, sizeof(f->name), "%s", name);
+    f->size = MB * 1000000; f->ts = ts; f->frames = frames; f->w = w; f->h = h; f->audio = audio;
+}
+
+static void clips_on_card(void)
+{
+    dcim_n = 0;
+    add_clip("M07-0624.MLV", 255, 100, 122, 2520, 1080, 1);
+    add_clip("M07-0809.MLV", 764, 200, 380, 2520, 1080, 1);
+    add_clip("M07-0809.M00", 300, 201, 0, 0, 0, 0);
+    add_clip("M08-0001.MLV", 40, 300, 0, 2520, 1080, 0);       /* cut short: no frame count */
+    add_clip("IMG_0042.JPG", 6, 250, 0, 0, 0, 0);
+}
+
+static void s_clips(void)
+{
+    clips_on_card();
+    find_menu("Movie", "RAW video")->value = 1;
+    boot();
+    tap(K_PLAY, 0); run_for(800);
+    EXPECT(overlay_active && ov_mode == OV_SETTINGS && clips_mode == 1, "PLAY did not open the clip list (overlay %d mode %d clips %d)",
+           overlay_active, ov_mode, clips_mode);
+    EXPECT(mlv_play_runs == 0 && canon_got[K_PLAY] == 0, "PLAY went to the player / Canon as well");
+    EXPECT(clip_count == 3 && !strcmp(clips[0].name, "M08-0001.MLV"), "clips: %d, first %s", clip_count, clip_count ? clips[0].name : "-");
+    EXPECT(screen_says("Clips") && screen_says("M08-0001") && screen_says("--:--") && screen_says("1.0 GB") && screen_says("0:15"),
+           "clip list not drawn:\n%s", ui_text_drawn);
+    EXPECT(!screen_says("IMG_0042"), "a photo in the clip list");
+    ui_text_overflows = 0;
+    for (int i = 0; i < 8; i++) { tap(K_DOWN, 30); run_for(80); }
+    EXPECT(ui_text_overflows == 0, "clip list text overflowed (%s)", ui_text_overflow_last);
+    /* a clip: details, play */
+    settings_goto(SI_CLIP_BASE + 1);
+    tap(K_SET, 30); run_for(300);
+    EXPECT(clips_mode == 2 && clip_cur == 1 && screen_says("Length 0:15") && screen_says("2 files") && screen_says("sound yes"),
+           "clip page wrong:\n%s", ui_text_drawn);
+    EXPECT(sel_id() == SI_CLIP_PLAY, "clip page does not start on Play");
+    tap(K_INFO, 0); run_for(300);
+    EXPECT(overlay_active && clips_mode == 1, "INFO on a clip did not go back to the list");
+    tap(K_SET, 30); run_for(300);
+    tap(K_SET, 30); run_for(1200);
+    EXPECT(!overlay_active && !strcmp(mlv_played, "B:/DCIM/100CANON/M07-0809.MLV") && play_req_len == 0,
+           "Play: overlay %d, player got '%s'", overlay_active, mlv_played);
+    EXPECT(gui_state == 0, "gui_state held after handing over to the player");
+    /* delete: asks, Keep is first, Delete removes the clip and its chunks */
+    tap(K_PLAY, 0); run_for(800);
+    EXPECT(clips_mode == 1, "PLAY did not reopen the list");
+    settings_goto(SI_CLIP_BASE + 1); tap(K_SET, 30); run_for(300);
+    settings_goto(SI_CLIP_DELETE); tap(K_SET, 30); run_for(300);
+    EXPECT(clips_mode == 3 && sel_id() == SI_DEL_KEEP && screen_says("deleted for good"), "delete question wrong (mode %d on %d)", clips_mode, sel_id());
+    tap(K_SET, 30); run_for(300);
+    EXPECT(clips_mode == 2 && removals == 0, "Keep it removed something / did not go back");
+    settings_goto(SI_CLIP_DELETE); tap(K_SET, 30); run_for(300);
+    settings_goto(SI_DEL_YES); tap(K_SET, 30); run_for(500);
+    EXPECT(strstr(removed, "M07-0809.MLV") && strstr(removed, "M07-0809.M00") && clip_count == 2 && clips_mode == 1,
+           "delete: removed '%s', %d clips, mode %d", removed, clip_count, clips_mode);
+    EXPECT(screen_says("Deleted"), "no confirmation after deleting");
+    EXPECT(!strstr(removed, "IMG_") && !strstr(removed, "M07-0624"), "deleted the wrong files: %s", removed);
+    /* PLAY on the list just closes it (no reopening loop) */
+    tap(K_PLAY, 0); run_for(1000);
+    EXPECT(!overlay_active && mlv_play_runs == 1, "PLAY on the list: overlay %d", overlay_active);
+    /* Canon's playback from the list */
+    tap(K_PLAY, 0); run_for(800);
+    int c0 = canon_got[K_PLAY];
+    settings_goto(SI_CANON_PLAY); tap(K_SET, 30); run_for(1000);
+    EXPECT(!overlay_active && canon_got[K_PLAY] == c0 + 1, "Canon playback: overlay %d, Canon PLAY %d->%d", overlay_active, c0, canon_got[K_PLAY]);
+    cam.playback = 0; cam.lv_on = 1; run_for(300);
+    finish();
+}
+
+static void s_clips_left_alone(void)
+{
+    clips_on_card();
+    boot();
+    /* RAW off: Canon's playback, as always */
+    int c0 = canon_got[K_PLAY];
+    tap(K_PLAY, 0); run_for(500);
+    EXPECT(!overlay_active && canon_got[K_PLAY] == c0 + 1, "RAW off: PLAY not Canon's");
+    cam.playback = 0; cam.lv_on = 1; run_for(300);
+    /* switched off: straight into the player, as before */
+    find_menu("Movie", "RAW video")->value = 1;
+    cfg_clips = 0;
+    tap(K_PLAY, 0); run_for(500);
+    EXPECT(!overlay_active && mlv_play_runs == 1, "Clips on PLAY off: player not started");
+    cfg_clips = 1;
+    /* REC on the list: closes, records RAW */
+    tap(K_PLAY, 0); run_for(800);
+    tap(K_REC, 0); run_for(400);
+    EXPECT(!overlay_active && raw_recordings == 1, "REC on the clip list: overlay %d, %d RAW", overlay_active, raw_recordings);
+    cam.recording = 0; run_for(3500);
+    /* an empty card */
+    dcim_n = 0;
+    tap(K_PLAY, 0); run_for(800);
+    EXPECT(clips_mode == 1 && screen_says("No RAW clips"), "empty card: no explanation");
     finish();
 }
 
@@ -2217,10 +2524,17 @@ static const struct sc all[] = {
     { "focus punch-in: x10, back, close, close mid-zoom, REC at x10", s_focus_punch_in },
     { "welcome on the first start, and again from Settings", s_welcome },
     { "welcome waits for calm movie LiveView", s_welcome_waits },
-    { "focus: half-press focuses at x10, release goes back to x5", s_focus_half_press },
-    { "focus: a tap focuses there at x10; second tap; no confirmation", s_focus_tap },
+    { "welcome stays seen after a battery pull (marker file)", s_welcome_after_battery_pull },
+    { "recording preview: exact framing, no half-press swap; user's choice kept", s_recording_preview_defaults },
+    { "recording preview fixed at start-up when RAW is already on", s_recording_preview_at_boot },
+    { "focus box: tap moves it and focuses in place (no zoom), green / red, repaired, hidden by the bar", s_focus_box },
+    { "focus box: not outside Crop Mood, MF, off, ML menu; stays put while recording", s_focus_box_not_shown },
+    { "focus (Precise): half-press focuses at x10, release goes back to x5", s_focus_half_press },
+    { "focus (Precise): a tap focuses there at x10; second tap; no confirmation", s_focus_tap },
     { "focus: x1, manual focus, switched off, recording are left to Canon / Crop Mood", s_focus_leaves_alone },
-    { "focus: REC, INFO, ML's menu during a focus job", s_focus_keys_meanwhile },
+    { "focus (Precise): REC, INFO, ML's menu during a focus job", s_focus_keys_meanwhile },
+    { "clips: PLAY lists them, details, play the chosen one, delete with a question, Canon playback", s_clips },
+    { "clips: RAW off, switched off, REC on the list, empty card", s_clips_left_alone },
     { "soak: 4000 random steps of keys and camera events", s_soak },
 };
 

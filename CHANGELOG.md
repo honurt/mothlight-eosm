@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0 (24 Nov 2026)
+
+- **Focus box, like Canon's.** In Crop Mood presets a tap now moves a small focus box to that
+  spot and focuses right there -- no zoom. Mothlight draws the box where Canon's AF point really
+  is (Crop Mood hides Canon's own): white, green when focused, red when it could not. Half-press
+  stays Canon's and the box shows the result. x10 focusing is still there as "Precise (x10)".
+- **No more "too zoomed in" while recording, no half-press flash.** While recording, Crop Mood
+  stops correcting Canon's preview, so "Canon (live)" showed Canon's real x5 view (tighter than
+  the clip, with vertical lines). RAW profiles now use MLV Lite's exact-framing preview (grey
+  while recording), once; your own choice in Settings is kept. MLV Lite's hidden "Preview toggle"
+  (swap to ML's preview on a long half-press -- the flash) is turned off.
+- **Clips on PLAY.** With RAW on, PLAY opens Mothlight's clip list: newest first, length, frame
+  size and size; a clip's page with Play / Delete (asks first, "Keep it" preselected) / Back;
+  Canon's playback for photos and H.264. MLV Play (engine patch 0003) plays the chosen clip and
+  **any button now cancels while it prepares a clip** -- no more restarting the camera.
+- **The welcome page shows once**, even after a battery pull: ML saves module settings only on
+  a clean power-off, so Mothlight writes a tiny marker file (ML/SETTINGS/MOTHWEL.TXT) at once.
+
 ## 0.4.0 (24 Nov 2026)
 
 - **Tap to focus, the reliable way.** Crop Mood runs every preset in x5 and hides Canon's layer

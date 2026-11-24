@@ -1,0 +1,146 @@
+diff --git a/modules/mlv_play/mlv_play.c b/modules/mlv_play/mlv_play.c
+index 9c83d45..506cc96 100644
+--- a/modules/mlv_play/mlv_play.c
++++ b/modules/mlv_play/mlv_play.c
+@@ -173,6 +173,13 @@ static void mlv_playlist_delete(playlist_entry_t current);
+ static void mlv_playlist_build(uint32_t priv);
+ static uint32_t mlv_play_should_stop();
+ 
++/* Mothlight (patches/cropmood/0003): any button cancels while a clip is being prepared,
++   PLAY can be left to Mothlight's clip list, which asks for a clip through a small file */
++static volatile int mlv_play_busy = 0;
++static volatile int mlv_play_cancel = 0;
++#define MOTH_PLAY_REQUEST "ML/SETTINGS/MOTHPLAY.REQ"
++static char moth_play_request[MAX_PATH];
++
+ /* microsecond durations for one frame */
+ static uint32_t mlv_play_frame_div_pos = 0;
+ static uint32_t mlv_play_frame_dividers[3];
+@@ -1112,6 +1119,12 @@ static void mlv_play_build_index(char *filename, FILE **chunk_files, uint32_t ch
+             {
+                 break;
+             }
++            if(mlv_play_cancel)
++            {
++                /* cancelled: no partial index on the card */
++                if(frame_xref_table) free(frame_xref_table);
++                return;
++            }
+             
+             mlv_hdr_t buf;
+             uint64_t timestamp = 0;
+@@ -1234,7 +1247,9 @@ static mlv_xref_hdr_t *mlv_play_get_index(char *filename, FILE **chunk_files, ui
+     
+     bmp_printf(FONT_LARGE, 30, 100, "Preparing:", filename);
+     bmp_printf(FONT_MED, 40, 100 + font_large.height + 1, filename);
++    bmp_printf(FONT_MED, 40, 100 + font_large.height + font_med.height + 8, "First time only. Any button cancels.");
+     mlv_play_build_index(filename, chunk_files, chunk_count);
++    if (mlv_play_cancel) return NULL;
+     
+     return mlv_play_load_index(filename);
+ }
+@@ -1592,6 +1607,11 @@ static void mlv_play_render_task(uint32_t priv)
+ 
+ static uint32_t mlv_play_should_stop()
+ {
++    if (mlv_play_cancel)
++    {
++        return 1;
++    }
++
+     /* powering off the camera is for sure a good reason to stop any playback */
+     if(ml_shutdown_requested)
+     {
+@@ -1735,6 +1755,10 @@ static void mlv_play_mlv(char *filename, FILE **chunk_files, uint32_t chunk_coun
+     
+     /* load or create index file */
+     block_xref = mlv_play_get_index(filename, chunk_files, chunk_count);
++    if (!block_xref && mlv_play_cancel)
++    {
++        return;
++    }
+     if (!block_xref)
+     {
+         bmp_printf(FONT_LARGE, 30, 100, "Index error:", filename);
+@@ -2469,7 +2493,7 @@ static void mlv_playlist_build(uint32_t priv)
+     char *directory = NULL;
+     while(!msg_queue_receive(mlv_playlist_scan_queue, &directory, 50))
+     {
+-        mlv_playlist_build_path(directory);
++        if (!mlv_play_cancel) mlv_playlist_build_path(directory);
+         free(directory);
+     }
+     
+@@ -2630,6 +2654,8 @@ static void mlv_play_task(void *priv)
+     FILE **chunk_files = NULL;
+     uint32_t chunk_count = 0;
+     char *filename = (char *)priv;
++    mlv_play_cancel = 0;
++    mlv_play_busy = 1;
+     
+     /* playback at last recorded file */
+     if(!filename)
+@@ -2651,6 +2677,7 @@ static void mlv_play_task(void *priv)
+     mlv_play_show_dlg(0, "Building playlist...");
+     mlv_playlist_build(0);
+     mlv_play_show_dlg(0, 0);
++    if (mlv_play_cancel) goto cleanup;
+     
+     if (filename)
+     {
+@@ -2731,6 +2758,8 @@ static void mlv_play_task(void *priv)
+     } while(!mlv_play_should_stop());
+     
+ cleanup:
++    mlv_play_busy = 0;
++    mlv_play_cancel = 0;
+     mlv_playlist_free();
+     mlv_play_leave_playback();
+     mlv_play_delete_requested = 0;
+@@ -2791,6 +2820,17 @@ FILETYPE_HANDLER(mlv_play_filehandler)
+ 
+ static unsigned int mlv_play_keypress_cbr(unsigned int key)
+ {
++    /* preparing (playlist, index, first frame): any button press cancels and goes back */
++    if (mlv_play_busy && !mlv_play_rendering)
++    {
++        if (key && key != MODULE_KEY_UNPRESS_SET && key != MODULE_KEY_UNPRESS_UDLR &&
++            key != MODULE_KEY_UNPRESS_HALFSHUTTER && key != MODULE_KEY_UNTOUCH_1_FINGER)
++        {
++            mlv_play_cancel = 1;
++            return 0;
++        }
++        return 1;
++    }
+     if (mlv_play_rendering)
+     {
+         switch(key)
+@@ -2867,6 +2907,28 @@ static unsigned int mlv_play_keypress_cbr(unsigned int key)
+         {
+             case MODULE_KEY_PLAY:
+             {
++                /* a clip chosen in Mothlight's list? */
++                uint32_t size = 0;
++                if (FIO_GetFileSize(MOTH_PLAY_REQUEST, &size) == 0 && size > 0 && size < sizeof(moth_play_request))
++                {
++                    FILE * f = FIO_OpenFile(MOTH_PLAY_REQUEST, O_RDONLY | O_SYNC);
++                    int n = f ? FIO_ReadFile(f, moth_play_request, size) : 0;
++                    if (f) FIO_CloseFile(f);
++                    FIO_RemoveFile(MOTH_PLAY_REQUEST);
++                    if (n > 0)
++                    {
++                        moth_play_request[n] = 0;
++                        char * nl = strchr(moth_play_request, '\n');
++                        if (nl) *nl = 0;
++                        task_create("mlv_play_task", 0x1e, 0x4000, mlv_play_task, moth_play_request);
++                        return 0;
++                    }
++                }
++                /* Mothlight shows its clip list on PLAY */
++                if (menu_get_value_from_script("Mothlight", "Clips on PLAY") == 1)
++                {
++                    return 1;
++                }
+                 task_create("mlv_play_task", 0x1e, 0x4000, mlv_play_task, NULL);
+                 return 0;
+             }

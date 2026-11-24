@@ -64,7 +64,9 @@ static CONFIG_INT("moth.bpp11",   cfg_bpp11,   0);
 static CONFIG_INT("moth.bpp12",   cfg_bpp12,   0);
 static CONFIG_INT("moth.bpp14",   cfg_bpp14,   0);
 static CONFIG_INT("moth.welcomed", cfg_welcomed, 0); /* the first-start welcome was shown */
-static CONFIG_INT("moth.focus",   cfg_focus,   1);    /* Crop Mood x5: 1 tap / half-press focus at x10, 0 Canon's */
+static CONFIG_INT("moth.focus",   cfg_focus,   1);
+static CONFIG_INT("moth.prevset", cfg_prevset, 0);    /* the recording preview default was set once */
+static CONFIG_INT("moth.clips",   cfg_clips,   1);    /* PLAY (RAW on) opens Mothlight's clip list */    /* Crop Mood x5: 1 tap / half-press focus at x10, 0 Canon's */
 
 static const int card_mb[] = { 0, 30, 40, 50, 60, 65, 70, 75, 80, 90 };
 
@@ -89,7 +91,11 @@ static struct settings_view sview;
 static int settings_from_bar;
 static int welcome_mode;                    /* the settings page shows the welcome / setup check */
 static int welcome_from_settings;           /* ... opened from Settings: back goes to Settings */
-static int welcome_tried;                   /* the automatic first-start welcome was opened this boot */               /* the settings page was opened from the quick bar */
+static int welcome_tried;                   /* the automatic first-start welcome was opened this boot */
+static int welcome_mark_pending;            /* seen: write the marker file once idle (never while recording) */
+static int clips_mode;                      /* the settings page shows the clip list (1), a clip (2), delete? (3) */
+static volatile int clips_resent;           /* a PLAY we sent on ourselves: let it through once */
+static int clips_play_pending;              /* 1 play the chosen clip, 2 Canon's playback */
 static int bar_hint_seen;                   /* after the first time, the bar's strip shows warnings */
 
 /* focus punch-in: x10 from the bar, back to where we were afterwards */
@@ -364,6 +370,22 @@ static int set_menu(const char * menu, const char * entry, int value)
     return r != INT_MIN;
 }
 
+/* While recording, Crop Mood stops correcting Canon's preview: "Canon (live)" then shows the
+   real x5 magnification (tighter than the clip, with vertical lines). ML's framing preview shows
+   exactly what is recorded. And MLV Lite's "Preview toggle" swaps the screen on every long
+   half-press (the flash on autofocus): off. The preview choice is set once; after that it is
+   the user's (Settings > Screen while recording RAW). */
+static void recording_preview_defaults(void)
+{
+    if (menu_get_value_from_script("RAW video", "Preview toggle") > 0)
+        menu_set_value_from_script("RAW video", "Preview toggle", 0);
+    if (!cfg_prevset && menu_get_value_from_script("RAW video", "Preview") != INT_MIN)
+    {
+        menu_set_value_from_script("RAW video", "Preview", 2);       /* ML framing */
+        cfg_prevset = 1;
+    }
+}
+
 static const char * apply_start(const struct rec_profile * p)
 {
     if (RECORDING) return "Stop recording first";
@@ -390,6 +412,7 @@ static const char * apply_start(const struct rec_profile * p)
     set_menu("Crop mood", "Bit-depth", p->bits);
     set_menu("RAW video", "Resolution", 11);            /* widest: clamps to the preset */
     set_menu("RAW video", "Aspect ratio", 17);          /* tallest: follows Crop Mood's frame */
+    recording_preview_defaults();
 
     /* Crop Mood's presets run in Canon's x5 zoom on the EOS M */
     if (lv_dispsize == 1) set_lv_zoom(5);
@@ -639,6 +662,31 @@ static const char * qb_locked_reason(int item)
     return "Automatic: in Canon's menu set Movie exposure to Manual";
 }
 
+/* ---------------------------------------------------------------- the welcome's marker
+
+   ML writes module settings to the card only on a clean power-off; after a battery pull the
+   welcome came back. A tiny file written as soon as it was seen survives that. */
+
+static void welcome_marker_path(char * p, int len) { snprintf(p, len, "%sMOTHWEL.TXT", get_config_dir()); }
+
+static int welcome_marker_exists(void)
+{
+    char p[64]; uint32_t size = 0;
+    welcome_marker_path(p, sizeof(p));
+    return FIO_GetFileSize(p, &size) == 0;
+}
+
+static void welcome_marker_write(void)
+{
+    char p[64];
+    welcome_marker_path(p, sizeof(p));
+    FILE * f = FIO_CreateFile(p);
+    if (!f) return;
+    static const char text[] = "Mothlight: the welcome page was seen. Delete this file to see it again.\n";
+    FIO_WriteFile(f, text, sizeof(text) - 1);
+    FIO_CloseFile(f);
+}
+
 /* ---------------------------------------------------------------- smart warnings */
 
 static void load_profiles(void);
@@ -719,8 +767,18 @@ static void zoom_restore_step(void)
    The recorded framing ends where it was: the AF point is centred again before x5. */
 
 enum { FJ_IDLE, FJ_ZOOM, FJ_AF, FJ_HOLD, FJ_BACK };
+enum { FOCUS_CANON = 0, FOCUS_BOX = 1, FOCUS_X10 = 2 };
+
+/* the focus box: Canon draws one at x1 and lets a tap move it; Crop Mood hides Canon's layer in
+   x5, so Mothlight draws it -- where Canon's AF point really is, with the result's colour */
+enum { FB_IDLE, FB_FOCUSING, FB_OK, FB_FAIL };
+static volatile int fb_result = FB_IDLE;
+static volatile uint32_t fb_result_until;
+#define FB_W 76
+#define FB_H 56
 static volatile int fj_state;              /* the focus job's phase (FJ_IDLE: none) */
 static volatile int fj_from_half;          /* started by half-press: hold while it is held */
+static volatile int fj_mode;               /* FOCUS_BOX (AF where tapped, no zoom) or FOCUS_X10 */
 static volatile int fj_half_held;
 static volatile int fj_tap_x = -1, fj_tap_y;
 static volatile int fj_cancel;             /* a key asked to finish early */
@@ -731,38 +789,61 @@ static int fj_focused;                     /* the last AF confirmed focus */
 
 static int focus_takes_over(void)
 {
-    if (!cfg_focus || !lv || RECORDING || !is_movie_mode() || gui_menu_shown() || overlay_active) return 0;
+    if (cfg_focus == FOCUS_CANON || !lv || RECORDING || !is_movie_mode() || gui_menu_shown() || overlay_active) return 0;
     if (!lens_info.lens_exists || is_manual_focus()) return 0;      /* MF: Crop Mood's own x10 key */
     int mood = menu_get_value_from_script("Movie", "Crop mood");
     return mood != INT_MIN && mood > 0 && lv_dispsize == 5;
 }
 
-/* screen point -> where Canon's AF point must go (its own coordinates, the whole sensor):
-   the x5 preview shows the recorded window, centred on the sensor, across the screen width */
-static void tap_to_afframe(int x, int y, int * dx, int * dy)
+/* Where the x5 preview's picture sits on Canon's AF coordinates (the whole sensor): the
+   recorded window, centred, across the screen's width; its height follows the frame */
+struct af_geo { int W, H, span_x, span_y, disp_h; };
+
+static int af_geometry(struct af_geo * g)
 {
-    int W = 0, H = 0, cx, cy;
-    get_afframe_sensor_res(&W, &H);
-    *dx = *dy = 0;
-    if (W <= 0 || H <= 0) return;
-    get_afframe_pos(W, H, &cx, &cy);
+    g->W = g->H = 0;
+    get_afframe_sensor_res(&g->W, &g->H);
+    if (g->W <= 0 || g->H <= 0) return 0;
     const struct rec_profile * p = (cfg_active >= 0 && cfg_active < profile_count) ? &profiles[cfg_active] : 0;
     int w = live_fmt.width > 0 ? live_fmt.width : p ? p->nominal.width : 0;
     int h = live_fmt.height > 0 ? live_fmt.height : p ? p->nominal.height : 0;
-    if (w <= 0 || h <= 0) return;
+    if (w <= 0 || h <= 0) return 0;
     int mood = p ? p->mood : MOOD_1X1;
-    int span_x = w * (mood == MOOD_1X1 ? 1 : 3);       /* 1x3 and 3x3 bin columns by 3 */
-    int span_y = h * (mood == MOOD_3X3 ? 3 : 1);
-    if (span_x > W) span_x = W;
-    if (span_y > H) span_y = H;
-    int disp_h = UI_W * span_y / span_x;                  /* the picture's height on screen */
-    if (disp_h > UI_H) disp_h = UI_H;
-    if (disp_h < 1) disp_h = 1;
-    int tx = W / 2 + (x - UI_W / 2) * span_x / UI_W;
-    int ty = H / 2 + (y - UI_H / 2) * span_y / disp_h;
+    g->span_x = w * (mood == MOOD_1X1 ? 1 : 3);         /* 1x3 and 3x3 bin columns by 3 */
+    g->span_y = h * (mood == MOOD_3X3 ? 3 : 1);
+    if (g->span_x > g->W) g->span_x = g->W;
+    if (g->span_y > g->H) g->span_y = g->H;
+    g->disp_h = UI_W * g->span_y / g->span_x;             /* the picture's height on screen */
+    if (g->disp_h > UI_H) g->disp_h = UI_H;
+    if (g->disp_h < 1) g->disp_h = 1;
+    return 1;
+}
+
+/* screen point -> how far Canon's AF point must move */
+static void tap_to_afframe(int x, int y, int * dx, int * dy)
+{
+    struct af_geo g;
+    int cx, cy;
+    *dx = *dy = 0;
+    if (!af_geometry(&g)) return;
+    get_afframe_pos(g.W, g.H, &cx, &cy);
+    int tx = g.W / 2 + (x - UI_W / 2) * g.span_x / UI_W;
+    int ty = g.H / 2 + (y - UI_H / 2) * g.span_y / g.disp_h;
     *dx = tx - cx;
     *dy = ty - cy;
-    mlog_v('F', 9, x, y, (uint32_t)(W << 16 | (H & 0xffff)));
+    mlog_v('F', 9, x, y, (uint32_t)(g.W << 16 | (g.H & 0xffff)));
+}
+
+/* Canon's AF point -> screen (the centre of the focus box); 0 if unknown / off the picture */
+static int afframe_to_screen(int * x, int * y)
+{
+    struct af_geo g;
+    int cx, cy;
+    if (!af_geometry(&g)) return 0;
+    get_afframe_pos(g.W, g.H, &cx, &cy);
+    *x = UI_W / 2 + (cx - g.W / 2) * UI_W / g.span_x;
+    *y = UI_H / 2 + (cy - g.H / 2) * g.disp_h / g.span_y;
+    return *x >= 0 && *x < UI_W && *y >= 0 && *y < UI_H;
 }
 
 static void focus_task(void * arg)
@@ -776,6 +857,29 @@ static void focus_task(void * arg)
         tap_to_afframe(fj_tap_x, fj_tap_y, &dx, &dy);
         if (dx || dy) { move_lv_afframe(dx, dy); fj_moved_dx = dx; fj_moved_dy = dy; }
         mlog('F', 1, dx, dy);
+    }
+    if (fj_mode == FOCUS_BOX)
+    {
+        /* Canon's way: autofocus right there, no zoom; the box shows how it went */
+        fj_state = FJ_AF;
+        fb_result = FB_FOCUSING;
+        fj_focused = 0;
+        SW1(1, 50);
+        uint32_t t0 = get_ms_clock();
+        while (!fj_cancel && get_ms_clock() - t0 < 2000 && !RECORDING)
+        {
+            if (get_focus_confirmation()) { fj_focused = 1; break; }
+            msleep(40);
+        }
+        SW1(0, 50);
+        fb_result = fj_focused ? FB_OK : FB_FAIL;
+        fb_result_until = get_ms_clock() + 1500;
+        mlog('F', 3, fj_focused, 1);
+        fj_moved_dx = fj_moved_dy = 0;      /* the AF point stays where tapped, as Canon's does */
+        fj_tap_x = -1;
+        fj_cancel = 0;
+        fj_state = FJ_IDLE;
+        return;
     }
     /* 2. x10 there, with Canon's layer on: its real focus box */
     fj_state = FJ_ZOOM;
@@ -818,22 +922,100 @@ static void focus_task(void * arg)
     mlog('F', 4, lv_dispsize, fj_cancel);
     fj_tap_x = -1;
     fj_cancel = 0;
-    if (!overlay_active) release_gui_state();
+    if (!overlay_active && fj_mode == FOCUS_X10) release_gui_state();
     fj_state = FJ_IDLE;
 }
 
 static void focus_start(int x, int y, int from_half)
 {
     if (fj_state != FJ_IDLE || zoom_job) return;
+    fj_mode = cfg_focus == FOCUS_X10 ? FOCUS_X10 : FOCUS_BOX;
     fj_tap_x = x; fj_tap_y = y;
     fj_from_half = from_half;
     fj_half_held = from_half;
     fj_cancel = 0;
     fj_state = FJ_ZOOM;
-    /* ML's GUI state busy, as with the bar: MLV Lite would otherwise start RAW on REC at x10,
-       and ML's own long-press checks would redraw over Canon's x10 view */
-    hold_gui_state();
+    /* x10: ML's GUI state busy, as with the bar: MLV Lite would otherwise start RAW on REC at x10,
+       and ML's own long-press checks would redraw over Canon's x10 view. The box job is short
+       and stays in x5: REC and everything else go on as usual. */
+    if (fj_mode == FOCUS_X10) hold_gui_state();
     task_create("moth_focus", 0x1e, 0x1000, (void *) focus_task, 0);
+}
+
+/* ---------------------------------------------------------------- drawing the focus box */
+
+static struct { int shown, x, y, color, thick; } fb_drawn;
+
+static void fb_outline(uint8_t * bmp, int cx, int cy, int thick, int color, int erase)
+{
+    int x0 = cx - FB_W / 2, y0 = cy - FB_H / 2;
+    for (int t = 0; t < thick; t++)
+        for (int side = 0; side < 4; side++)
+        {
+            int len = side < 2 ? FB_W : FB_H;
+            for (int i = 0; i < len; i++)
+            {
+                int x = side == 0 || side == 1 ? x0 + i : side == 2 ? x0 + t : x0 + FB_W - 1 - t;
+                int y = side == 0 ? y0 + t : side == 1 ? y0 + FB_H - 1 - t : y0 + i;
+                if (x < 0 || x >= UI_W || y < 0 || y >= UI_H) continue;
+                uint8_t * px = bmp + y * BMPPITCH + x;
+                if (erase) { if (*px == color) *px = COLOR_EMPTY; }    /* only our own pixels */
+                else *px = color;
+            }
+        }
+}
+
+static int fb_intact(uint8_t * bmp)
+{
+    int x0 = fb_drawn.x - FB_W / 2, y0 = fb_drawn.y - FB_H / 2;
+    int probes[4][2] = { { x0 + 3, y0 }, { x0 + FB_W - 4, y0 + FB_H - 1 }, { x0, y0 + FB_H / 2 }, { x0 + FB_W - 1, y0 + 5 } };
+    for (int i = 0; i < 4; i++)
+    {
+        int x = probes[i][0], y = probes[i][1];
+        if (x < 0 || x >= UI_W || y < 0 || y >= UI_H) continue;
+        if (bmp[y * BMPPITCH + x] != fb_drawn.color) return 0;
+    }
+    return 1;
+}
+
+static void focus_box_erase(void)
+{
+    uint8_t * bmp = bmp_vram_real();
+    if (fb_drawn.shown && bmp) fb_outline(bmp, fb_drawn.x, fb_drawn.y, fb_drawn.thick, fb_drawn.color, 1);
+    fb_drawn.shown = 0;
+}
+
+static int focus_box_wanted(void)
+{
+    if (cfg_focus != FOCUS_BOX || overlay_active || !lv || !is_movie_mode() || gui_menu_shown() || !display_is_on()) return 0;
+    if (!lens_info.lens_exists || is_manual_focus()) return 0;
+    int mood = menu_get_value_from_script("Movie", "Crop mood");
+    return mood != INT_MIN && mood > 0 && lv_dispsize == 5;
+}
+
+/* every idle loop (~10 Hz): show, move, recolour or repair the box */
+static void focus_box_step(uint32_t now)
+{
+    uint8_t * bmp = bmp_vram_real();
+    int x, y;
+    if (!bmp || !focus_box_wanted() || !afframe_to_screen(&x, &y)) { focus_box_erase(); return; }
+    x = COERCE(x, FB_W / 2, UI_W - FB_W / 2 - 1);
+    y = COERCE(y, FB_H / 2 + 2, UI_H - FB_H / 2 - 3);
+
+    int state = fb_result;
+    if ((state == FB_OK || state == FB_FAIL) && (int32_t)(now - fb_result_until) > 0) state = fb_result = FB_IDLE;
+    if (state == FB_IDLE && get_halfshutter_pressed()) state = get_focus_confirmation() ? FB_OK : FB_FOCUSING;
+    int color = state == FB_OK ? COLOR_GREEN1 : state == FB_FAIL ? COLOR_RED : COLOR_WHITE;
+    int thick = state == FB_FOCUSING ? 3 : 2;
+
+    if (fb_drawn.shown && fb_drawn.x == x && fb_drawn.y == y && fb_drawn.color == color && fb_drawn.thick == thick)
+    {
+        if (!fb_intact(bmp)) fb_outline(bmp, x, y, thick, color, 0);    /* something drew over it */
+        return;
+    }
+    focus_box_erase();
+    fb_outline(bmp, x, y, thick, color, 0);
+    fb_drawn.shown = 1; fb_drawn.x = x; fb_drawn.y = y; fb_drawn.color = color; fb_drawn.thick = thick;
 }
 
 /* ---------------------------------------------------------------- saving the current setup */
@@ -905,7 +1087,9 @@ static void save_current_profile(char * msg, int len, int * bad)
 
 enum { SI_THEME = 1, SI_MOTION, SI_INFO, SI_TALLY, SI_SDCLOCK, SI_CARD, SI_SOUND, SI_HACKS,
        SI_OVERLAYS, SI_ZEBRAS, SI_PEAK, SI_FALSECOLOR, SI_SAVE, SI_LEARNED, SI_WELCOME, SI_FOCUS, SI_PREVIEW,
-       SI_WELCOME_DONE, SI_CHECK_CROP, SI_CHECK_RAW, SI_CHECK_SD, SI_CHECK_EXPO, SI_CHECK_SOUND };
+       SI_WELCOME_DONE, SI_CHECK_CROP, SI_CHECK_RAW, SI_CHECK_SD, SI_CHECK_EXPO, SI_CHECK_SOUND,
+       SI_CANON_PLAY, SI_CLIP_PLAY, SI_CLIP_DELETE, SI_CLIP_BACK, SI_DEL_KEEP, SI_DEL_YES, SI_CLIPS_RESCAN,
+       SI_CLIP_BASE = 100 };
 
 static const char * theme_names[] = { "Mothlight", "Stock", "Studio", "Amber", "Signal", "Material",
                                       "Soft", "Glass", "Daylight", "Night", "Mono" };
@@ -928,6 +1112,221 @@ static void ml_value(char * buf, int len, const char * menu, const char * entry,
     *tone = ST_NORMAL;
 }
 
+/* ---------------------------------------------------------------- clips
+
+   The EOS M has no clip browser for MLV: PLAY went straight into the last clip, and the MLV
+   player then prepared it with no way out. Mothlight lists the clips first (length, size,
+   frame) and hands the chosen one to the player, patched so any button cancels. */
+
+#define CLIPS_MAX 40
+static int ends_with_mlv(const char * name);
+struct clip { char name[16]; uint32_t kB; uint32_t ts; int frames, fps_x1000, w, h, chunks, audio; };
+static struct clip clips[CLIPS_MAX];
+static int clip_count, clip_cur;
+
+static uint32_t rd32(const uint8_t * p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint16_t rd16(const uint8_t * p) { return p[0] | p[1] << 8; }
+
+/* MLVI and RAWI from the start of the file: frames, rate, sound, frame size */
+static void clip_read_header(const char * path, struct clip * c)
+{
+    FILE * f = FIO_OpenFile(path, O_RDONLY | O_SYNC);
+    if (!f) return;
+    static uint8_t hdr[64];
+    int pos = 0;
+    for (int b = 0; b < 12; b++)
+    {
+        if (FIO_SeekSkipFile(f, pos, SEEK_SET) != pos) break;
+        if (FIO_ReadFile(f, hdr, 52) < 20) break;
+        uint32_t size = rd32(hdr + 4);
+        if (size < 16 || size > 64 * 1024 * 1024) break;
+        if (!memcmp(hdr, "MLVI", 4))
+        {
+            c->audio = rd16(hdr + 34) != 0;
+            c->frames = rd32(hdr + 36);
+            uint32_t nom = rd32(hdr + 44), den = rd32(hdr + 48);
+            c->fps_x1000 = den ? (int)((uint64_t)nom * 1000 / den) : 0;
+        }
+        else if (!memcmp(hdr, "RAWI", 4)) { c->w = rd16(hdr + 16); c->h = rd16(hdr + 18); break; }
+        else if (!memcmp(hdr, "VIDF", 4)) break;
+        pos += size;
+    }
+    FIO_CloseFile(f);
+}
+
+static void clip_add(const char * name, uint32_t size, uint32_t ts)
+{
+    if (!ends_with_mlv(name) || strlen(name) >= sizeof(clips[0].name)) return;
+    int slot = clip_count < CLIPS_MAX ? clip_count++ : -1;
+    if (slot < 0)
+    {
+        /* full: replace the oldest if this one is newer */
+        int old = 0;
+        for (int i = 1; i < CLIPS_MAX; i++) if (clips[i].ts < clips[old].ts) old = i;
+        if (clips[old].ts >= ts) return;
+        slot = old;
+    }
+    struct clip * c = &clips[slot];
+    memset(c, 0, sizeof(*c));
+    snprintf(c->name, sizeof(c->name), "%s", name);
+    c->kB = size / 1000;
+    c->ts = ts;
+}
+
+static void clips_scan(void)
+{
+    clip_count = 0;
+    const char * dir = get_dcim_dir();
+#ifdef MOTH_ENGINE_UPSTREAM
+    struct fio_file * file = alloc_fio_file();
+    if (!file) return;
+    struct fio_dirent * d = FIO_FindFirstEx(dir, file);
+    if (!IS_ERROR(d))
+    {
+        do
+        {
+            struct file_info fi = convert_fio_file_info(file);
+            if (!(fi.mode & ATTR_DIRECTORY)) clip_add(fi.name, fi.size, (uint32_t)fi.timestamp);
+        } while (FIO_FindNextEx(d, file) == 0);
+        FIO_FindClose(d);
+    }
+    free(file);
+#else
+    struct fio_file file;
+    struct fio_dirent * d = FIO_FindFirstEx(dir, &file);
+    if (!IS_ERROR(d))
+    {
+        do { if (!(file.mode & ATTR_DIRECTORY)) clip_add(file.name, file.size, file.timestamp); }
+        while (FIO_FindNextEx(d, &file) == 0);
+        FIO_FindClose(d);
+    }
+#endif
+    /* newest first */
+    for (int i = 1; i < clip_count; i++)
+        for (int j = i; j > 0 && clips[j].ts > clips[j - 1].ts; j--)
+        { struct clip t = clips[j]; clips[j] = clips[j - 1]; clips[j - 1] = t; }
+    char path[96];
+    for (int i = 0; i < clip_count; i++)
+    {
+        struct clip * c = &clips[i];
+        snprintf(path, sizeof(path), "%s%s", dir, c->name);
+        clip_read_header(path, c);
+        c->chunks = 1;
+        int len = strlen(path);
+        for (int k = 0; k < 100; k++)
+        {
+            uint32_t size = 0;
+            snprintf(path + len - 2, 3, "%02d", k);
+            if (FIO_GetFileSize(path, &size) != 0) break;
+            c->kB += size / 1000;
+            c->chunks++;
+        }
+    }
+}
+
+static void clip_length(const struct clip * c, char * buf, int len)
+{
+    if (c->frames <= 0 || c->fps_x1000 <= 0) { snprintf(buf, len, "--:--"); return; }
+    int s = (int)((int64_t)c->frames * 1000 / c->fps_x1000);
+    snprintf(buf, len, "%d:%02d", s / 60, s % 60);
+}
+
+static void clip_size(const struct clip * c, char * buf, int len)
+{
+    if (c->kB >= 1000000) snprintf(buf, len, "%d.%d GB", (int)(c->kB / 1000000), (int)(c->kB / 100000 % 10));
+    else snprintf(buf, len, "%d MB", (int)(c->kB / 1000));
+}
+
+static void build_clips(struct settings_view * v)
+{
+    char label[64], val[28], len_s[12], size_s[16];
+    memset(v, 0, sizeof(*v));
+    v->theme = theme();
+    v->reduced_motion = !cfg_motion;
+    v->battery_bars = battery_level_bars;
+    v->set_word = "Open";
+    if (clips_mode == 1)
+    {
+        snprintf(v->title, sizeof(v->title), "Clips");
+        if (!clip_count) add_row(v, SR_NOTE, 0, 0, "No RAW clips on the card yet.", 0, 0);
+        else
+        {
+            snprintf(label, sizeof(label), "%d clip%s, newest first", clip_count, clip_count > 1 ? "s" : "");
+            add_row(v, SR_SECTION, 0, 0, label, 0, 0);
+        }
+        for (int i = 0; i < clip_count; i++)
+        {
+            const struct clip * c = &clips[i];
+            char base[16];
+            snprintf(base, sizeof(base), "%s", c->name);
+            for (int k = strlen(base) - 1; k > 0; k--) if (base[k] == '.') { base[k] = 0; break; }
+            clip_length(c, len_s, sizeof(len_s));
+            clip_size(c, size_s, sizeof(size_s));
+            snprintf(label, sizeof(label), "%s   %s", base, len_s);
+            if (c->w > 0) snprintf(val, sizeof(val), "%dx%d  %s", c->w, c->h, size_s);
+            else snprintf(val, sizeof(val), "%s", size_s);
+            add_row(v, SR_ITEM, SI_CLIP_BASE + i, 0, label, val,
+                    "SET: details, play or delete. The player prepares a clip the first time; any button cancels.");
+        }
+        add_row(v, SR_SECTION, 0, 0, "MORE", 0, 0);
+        add_row(v, SR_ITEM, SI_CANON_PLAY, 0, "Canon playback", "Photos, H.264",
+                "Canon's own playback for photos and H.264 movies. PLAY again to come back to LiveView.");
+        return;
+    }
+    const struct clip * c = &clips[(clip_cur >= 0 && clip_cur < clip_count) ? clip_cur : 0];
+    clip_length(c, len_s, sizeof(len_s));
+    clip_size(c, size_s, sizeof(size_s));
+    if (clips_mode == 2)
+    {
+        snprintf(v->title, sizeof(v->title), "%s", c->name);
+        if (c->fps_x1000 > 0) snprintf(label, sizeof(label), "Length %s at %d.%03d fps, %d frames", len_s, c->fps_x1000 / 1000, c->fps_x1000 % 1000, c->frames);
+        else snprintf(label, sizeof(label), "Length unknown (recording cut short?)");
+        add_row(v, SR_NOTE, 0, 0, label, 0, 0);
+        if (c->w > 0) { snprintf(label, sizeof(label), "Frame %d x %d", c->w, c->h); add_row(v, SR_NOTE, 0, 0, label, 0, 0); }
+        snprintf(label, sizeof(label), "%s in %d file%s, sound %s", size_s, c->chunks, c->chunks > 1 ? "s" : "", c->audio ? "yes" : "no");
+        add_row(v, SR_NOTE, 0, 0, label, 0, 0);
+        add_row(v, SR_ITEM, SI_CLIP_PLAY, ST_ACCENT, "Play", "",
+                "ML's player. The first time it prepares the clip (a short scan); any button cancels.");
+        add_row(v, SR_ITEM, SI_CLIP_DELETE, 0, "Delete", "",
+                "Asks first. Deleting removes the clip from the card for good.");
+        add_row(v, SR_ITEM, SI_CLIP_BACK, 0, "Back to clips", "", 0);
+        return;
+    }
+    snprintf(v->title, sizeof(v->title), "Delete?");
+    snprintf(label, sizeof(label), "%s (%s) will be deleted for good.", c->name, size_s);
+    add_row(v, SR_NOTE, 0, 0, label, 0, 0);
+    add_row(v, SR_ITEM, SI_DEL_KEEP, 0, "Keep it", "", 0);
+    add_row(v, SR_ITEM, SI_DEL_YES, ST_BAD, "Delete", "", "This cannot be undone.");
+}
+
+static int clip_delete(const struct clip * c)
+{
+    char path[96];
+    const char * dir = get_dcim_dir();
+    snprintf(path, sizeof(path), "%s%s", dir, c->name);
+    int ok = FIO_RemoveFile(path) == 0;
+    int len = strlen(path);
+    for (int k = 0; k < 100; k++)
+    {
+        snprintf(path + len - 2, 3, "%02d", k);
+        if (FIO_RemoveFile(path) != 0) break;
+    }
+    snprintf(path + len - 3, 4, "IDX");      /* the player's index */
+    FIO_RemoveFile(path);
+    return ok;
+}
+
+static int clip_request_play(const struct clip * c)
+{
+    char text[112];
+    int n = snprintf(text, sizeof(text), "%s%s\n", get_dcim_dir(), c->name);
+    FILE * f = FIO_CreateFile("ML/SETTINGS/MOTHPLAY.REQ");
+    if (!f) return 0;
+    FIO_WriteFile(f, text, n);
+    FIO_CloseFile(f);
+    return 1;
+}
+
 /* the first start: what Mothlight is, how to drive it, and whether the camera is set up for it */
 static void build_welcome(struct settings_view * v)
 {
@@ -937,6 +1336,7 @@ static void build_welcome(struct settings_view * v)
     v->reduced_motion = !cfg_motion;
     v->battery_bars = battery_level_bars;
     snprintf(v->title, sizeof(v->title), "Welcome");
+    v->set_word = "OK";
     {
         char line[48];
         snprintf(line, sizeof(line), "%s %s is installed and running.", MOTH_UI_NAME, MOTH_UI_VERSION);
@@ -948,7 +1348,7 @@ static void build_welcome(struct settings_view * v)
     add_row(v, SR_SECTION, 0, 0, "HOW IT WORKS", 0, 0);
     add_row(v, SR_NOTE, 0, 0, "INFO opens the quick bar at the bottom of the screen", 0, 0);
     add_row(v, SR_NOTE, 0, 0, "SET moves between tiles, UP / DOWN changes the value", 0, 0);
-    add_row(v, SR_NOTE, 0, 0, "Tap the picture (or half-press) to focus there at x10", 0, 0);
+    add_row(v, SR_NOTE, 0, 0, "Tap the picture: the focus box moves there and focuses", 0, 0);
     add_row(v, SR_NOTE, 0, 0, "PROFILE: recording presets.  FOCUS: x10 punch-in", 0, 0);
     add_row(v, SR_NOTE, 0, 0, "Two-finger tap: the menu, with Mothlight's settings first", 0, 0);
 
@@ -981,6 +1381,7 @@ static void build_welcome(struct settings_view * v)
 static void build_settings(struct settings_view * v)
 {
     if (welcome_mode) { build_welcome(v); return; }
+    if (clips_mode) { build_clips(v); return; }
     static const char * offon[] = { "Off", "On" };
     static const char * motion[] = { "Off", "Smooth" };
     static const char * info[] = { "Nothing", "Quick bar", "Profiles" };
@@ -1025,18 +1426,21 @@ static void build_settings(struct settings_view * v)
     add_row(v, SR_ITEM, SI_SOUND, tone, "Sound with RAW video", val,
             "Records a WAV next to the MLV. Turn it off at 240 MHz or for heavy profiles: it can stop RAW recording.");
     {
-        static const char * prev[] = { "Auto", "Canon (live)", "ML framing", "Frozen" };
+        static const char * prev[] = { "Auto", "Canon (live)", "Exact framing", "Frozen" };
         ml_value(val, sizeof(val), "RAW video", "Preview", prev, 4, &tone);
         add_row(v, SR_ITEM, SI_PREVIEW, tone, "Screen while recording RAW", val,
-                "Canon (live) is smooth but can show vertical lines in Crop Mood; they are not in the clip. ML framing is clean, slower.");
+                "Exact framing: what is recorded (grey while recording). Canon (live): colour, but in Crop Mood more zoomed in, with lines.");
     }
     ml_value(val, sizeof(val), "RAW video", "Small hacks", hacks, 4, &tone);
     add_row(v, SR_ITEM, SI_HACKS, tone, "Small hacks", val,
             "Pauses some of Canon's background work while recording, leaving more speed for the card.");
 
     add_row(v, SR_SECTION, 0, 0, "FOCUS AND EXPOSURE AIDS", 0, 0);
-    add_row(v, SR_ITEM, SI_FOCUS, 0, "Tap / half-press focus", cfg_focus ? "At x10 (accurate)" : "Canon's (x5)",
-            "Crop Mood presets: tap a spot or half-press, Mothlight focuses there at x10 (where AF is reliable), then goes back.");
+    {
+        static const char * fm[] = { "Off (Crop Mood's)", "Focus box", "Precise (x10)" };
+        add_row(v, SR_ITEM, SI_FOCUS, 0, "Tap to focus", fm[(cfg_focus >= 0 && cfg_focus <= 2) ? cfg_focus : 1],
+                "Focus box: tap a spot, the box moves there and focuses, like Canon. Precise: focuses at x10, then back.");
+    }
     add_row(v, SR_ITEM, SI_OVERLAYS, saved_global_draw < 0 ? ST_DIM : 0, "ML overlays",
             saved_global_draw < 0 ? "?" : saved_global_draw > 0 ? "On" : "Off",
             "Magic Lantern's drawings over LiveView. The aids below need it on. Hidden while Mothlight is open.");
@@ -1085,11 +1489,59 @@ static void settings_activate(int id, uint32_t now)
     do { v = menu_get_value_from_script(menu, entry); \
          if (v == INT_MIN) { snprintf(msg, sizeof(msg), missing); bad = 1; } \
          else menu_set_value_from_script(menu, entry, (v + 1) % (n)); } while (0)
+    if (id >= SI_CLIP_BASE && id < SI_CLIP_BASE + CLIPS_MAX)
+    {
+        clip_cur = id - SI_CLIP_BASE;
+        clips_mode = 2;
+        static struct settings_view fresh;
+        build_settings(&fresh);
+        sview = fresh;
+        settings_rebuilt(&sets, &sview, SI_CLIP_PLAY, now);
+        return;
+    }
     switch (id)
     {
+        case SI_CLIP_BACK: case SI_DEL_KEEP:
+        {
+            int back_to = id == SI_DEL_KEEP ? SI_CLIP_DELETE : SI_CLIP_BASE + clip_cur;
+            clips_mode = id == SI_DEL_KEEP ? 2 : 1;
+            static struct settings_view fresh;
+            build_settings(&fresh);
+            sview = fresh;
+            settings_rebuilt(&sets, &sview, back_to, now);
+            return;
+        }
+        case SI_CLIP_DELETE:
+        {
+            clips_mode = 3;
+            static struct settings_view fresh;
+            build_settings(&fresh);
+            sview = fresh;
+            settings_rebuilt(&sets, &sview, SI_DEL_KEEP, now);
+            return;
+        }
+        case SI_DEL_YES:
+        {
+            if (RECORDING) { snprintf(msg, sizeof(msg), "Stop recording first"); bad = 1; break; }
+            int ok = clip_delete(&clips[clip_cur]);
+            mlog('S', id, !ok, 0);
+            clips_scan();
+            clips_mode = 1;
+            if (clip_cur >= clip_count) clip_cur = clip_count - 1;
+            static struct settings_view fresh;
+            build_settings(&fresh);
+            sview = fresh;
+            settings_rebuilt(&sets, &sview, clip_cur >= 0 ? SI_CLIP_BASE + clip_cur : SI_CANON_PLAY, now);
+            settings_toast(&sets, ok ? "Deleted" : "Could not delete it", !ok, now);
+            return;
+        }
+        case SI_CLIP_PLAY: case SI_CANON_PLAY:
+            /* the camera task closes the page and sends PLAY on (to the player / to Canon) */
+            clips_play_pending = id == SI_CLIP_PLAY ? 1 : 2;
+            return;
         case SI_THEME:   cfg_theme = (cfg_theme + 1) % THEME_COUNT; break;
         case SI_MOTION:  cfg_motion = !cfg_motion; break;
-        case SI_FOCUS:   cfg_focus = !cfg_focus; break;
+        case SI_FOCUS:   cfg_focus = (cfg_focus + 1) % 3; break;
         case SI_INFO:    cfg_key = (cfg_key + 1) % 3; break;
         case SI_TALLY:   cfg_tally = (cfg_tally + 1) % 3; break;
         case SI_SDCLOCK:
@@ -1099,7 +1551,7 @@ static void settings_activate(int id, uint32_t now)
         case SI_CARD:    cfg_card = (cfg_card + 1) % (int)COUNT(card_mb); break;
         case SI_SOUND:   CYCLE("RAW video", "Sound recording", 2, "Load mlv_snd in Magic Lantern's Modules tab"); break;
         case SI_HACKS:   CYCLE("RAW video", "Small hacks", 3, "Small hacks need mlv_lite"); break;
-        case SI_PREVIEW: CYCLE("RAW video", "Preview", 4, "The preview setting needs mlv_lite"); break;
+        case SI_PREVIEW: CYCLE("RAW video", "Preview", 4, "The preview setting needs mlv_lite"); cfg_prevset = 1; break;
         case SI_OVERLAYS:
             /* Global Draw is off while Mothlight is open; this sets what comes back */
             if (saved_global_draw < 0) { snprintf(msg, sizeof(msg), "ML overlays are not available"); bad = 1; }
@@ -1221,6 +1673,7 @@ static int overlay_begin(void)
     gfx_clip_all(&back);
     memset(back_buf, 0, UI_W * UI_H);       /* transparent: the quick bar only draws its rows */
     zoom_restore = 0;                       /* opened again before zooming back: still punched in */
+    focus_box_erase();                      /* the bar would leave it floating above */
 
     /* ML's overlays step aside while the panel is up; Canon stops redrawing its own */
     saved_global_draw = menu_get_value_from_script("Overlay", "Global Draw");
@@ -1250,8 +1703,9 @@ static void overlay_end(int why)
     panel_from_bar = 0;
     settings_from_bar = 0;
     if (zoom_before) zoom_restore = 1;      /* the task zooms back once idle (then records, for REC) */
-    if (welcome_mode) cfg_welcomed = 1;     /* seen, however it was closed */
+    if (welcome_mode) { cfg_welcomed = 1; welcome_mark_pending = 1; }  /* seen, however it was closed */
     welcome_mode = welcome_from_settings = 0;
+    clips_mode = 0;
     tap_pending = 0;
     panel.state = PS_CLOSED;
     qbar.state = QB_CLOSED;
@@ -1411,6 +1865,7 @@ static void moth_task(void)
                 }
                 else if (mode == OV_SETTINGS)
                 {
+                    if (clips_mode) { clips_scan(); clips_mode = 1; }
                     build_settings(&sview);
                     settings_open(&sets, &sview, get_ms_clock());
                 }
@@ -1424,7 +1879,7 @@ static void moth_task(void)
             }
             open_request = 0;               /* an INFO that arrived while starting up is not a new request */
             opening = 0;
-            if (!overlay_active) welcome_mode = welcome_from_settings = 0;  /* could not open: next boot */
+            if (!overlay_active) welcome_mode = welcome_from_settings = clips_mode = 0;  /* could not open: next boot */
             continue;
         }
 
@@ -1449,12 +1904,33 @@ static void moth_task(void)
                 else act = settings_key(&sets, &sview, k, now);
                 if (act == SA_ACTIVATE && sets.act_id == SI_WELCOME_DONE) { go_back = 1; break; }
                 if (act == SA_ACTIVATE) { settings_activate(sets.act_id, now); now = get_ms_clock(); }
+                if (clips_play_pending) break;
+                if (act == SA_CLOSE && clips_mode > 1)
+                {
+                    /* INFO in a clip / delete question: one step back, not out */
+                    sets.open = 1;
+                    settings_activate(clips_mode == 3 ? SI_DEL_KEEP : SI_CLIP_BACK, now);
+                    act = SA_NONE;
+                    continue;
+                }
                 if (act == SA_CLOSE) { go_back = 1; break; }
             }
             if (closed) continue;
+            if (clips_play_pending)
+            {
+                int what = clips_play_pending;
+                clips_play_pending = 0;
+                int ok = what == 2 || clip_request_play(&clips[clip_cur]);
+                mlog('S', what == 1 ? SI_CLIP_PLAY : SI_CANON_PLAY, !ok, 0);
+                overlay_end(CLOSE_KEY);
+                clips_resent = what == 2 || !ok;      /* Canon's playback: Mothlight lets that PLAY through */
+                module_send_keypress(MODULE_KEY_PLAY);
+                continue;
+            }
             if (go_back && welcome_mode)
             {
                 cfg_welcomed = 1;
+                welcome_mark_pending = 1;
                 welcome_mode = 0;
                 if (welcome_from_settings)
                 {
@@ -1666,6 +2142,17 @@ static void moth_task(void)
         }
 
         if (!overlay_active) zoom_restore_step();
+        focus_box_step(now);
+        if (welcome_mark_pending && !RECORDING && !overlay_active) { welcome_mark_pending = 0; welcome_marker_write(); }
+        {
+            /* RAW already on from before: the preview fixes apply without re-applying a profile */
+            static int preview_checked;
+            if (!preview_checked && now > 3000 && !RECORDING)
+            {
+                preview_checked = 1;
+                if (menu_get_value_from_script("Movie", "RAW video") == 1) recording_preview_defaults();
+            }
+        }
         if (fj_rec_after && fj_state == FJ_IDLE && !overlay_active)
         {
             if (lv && lv_dispsize != 10 && !RECORDING) { fj_rec_after = 0; mlog('F', 5, 0, 0); module_send_keypress(MODULE_KEY_REC); }
@@ -1715,7 +2202,7 @@ static void moth_task(void)
 
 static unsigned int moth_keypress_cbr(unsigned int key)
 {
-    if (!overlay_active && fj_state != FJ_IDLE)
+    if (!overlay_active && fj_state != FJ_IDLE && fj_mode == FOCUS_X10)
     {
         /* the focus job is showing x10 */
         if (key == MODULE_KEY_UNPRESS_HALFSHUTTER) { fj_half_held = 0; return 0; }
@@ -1738,7 +2225,7 @@ static unsigned int moth_keypress_cbr(unsigned int key)
             { fj_cancel = 1; return 0; }
         return 1;
     }
-    if (!overlay_active && key == MODULE_KEY_PRESS_HALFSHUTTER && focus_takes_over())
+    if (!overlay_active && key == MODULE_KEY_PRESS_HALFSHUTTER && cfg_focus == FOCUS_X10 && focus_takes_over())
     {
         focus_start(-1, 0, 1);
         return 0;
@@ -1755,6 +2242,7 @@ static unsigned int moth_keypress_cbr(unsigned int key)
         return 1;
     }
     if (overlay_active && handing_back) return 1;
+    if (overlay_active && clips_mode && key == MODULE_KEY_PLAY) { push_key(PK_CLOSE); return 0; }
     if (overlay_active)
     {
         struct key_route r = moth_route_key(key);
@@ -1783,6 +2271,18 @@ static unsigned int moth_keypress_cbr(unsigned int key)
         }
         if (r.panel_key != PK_NONE) push_key(r.panel_key);
         return r.pass_to_canon;
+    }
+
+    if (key == MODULE_KEY_PLAY && !overlay_active)
+    {
+        if (clips_resent) { clips_resent = 0; return 1; }          /* ours, for Canon's playback */
+        if (cfg_clips && lv && is_movie_mode() && !RECORDING && !gui_menu_shown() &&
+            menu_get_value_from_script("Movie", "RAW video") == 1 && !opening && !open_request)
+        {
+            clips_mode = 1;
+            open_request = OV_SETTINGS;
+            return 0;
+        }
     }
 
     int trigger = cfg_key && key == MODULE_KEY_INFO;
@@ -1848,7 +2348,7 @@ static unsigned int moth_keypress_raw_cbr(unsigned int raw)
             mlog_v('X', p, ok, 2, v);
             if (p == EOSM_UNTOUCH_1)
             {
-                if (fj_state != FJ_IDLE) fj_cancel = 1;                 /* a second tap: done looking */
+                if (fj_state != FJ_IDLE) { if (fj_mode == FOCUS_X10) fj_cancel = 1; }   /* x10: done looking */
                 else focus_start(ok ? x : UI_W / 2, ok ? y : UI_H / 2, 0);
             }
             return 0;
@@ -1956,10 +2456,10 @@ static struct menu_entry moth_menu[] =
         .help2 = "Profiles: the profile list directly. 'nothing' gives INFO back to Canon.",
     },
     {
-        .name = "Tap / half-press focus", .priv = &cfg_focus, .max = 1,
-        .choices = CHOICES("Canon's (x5)", "At x10"),
-        .help = "Crop Mood presets: focus where you tap (or on half-press) at x10, then back.",
-        .help2 = "Crop Mood's x5 autofocus is unreliable; x10 is where Canon's AF works.",
+        .name = "Tap to focus", .priv = &cfg_focus, .max = 2,
+        .choices = CHOICES("OFF", "Focus box", "Precise (x10)"),
+        .help = "Crop Mood presets: Focus box = tap a spot, Canon-style box focuses there.",
+        .help2 = "Precise: half-press or tap focuses at x10 (most accurate), then back to x5.",
     },
     {
         .name = "Animations", .priv = &cfg_motion, .max = 1,
@@ -1981,6 +2481,12 @@ static struct menu_entry moth_menu[] =
     {
         .name = "Compression", .update = learned_update, .select = learned_reset,
         .help = "Learned from your clips after each recording. SET resets it.",
+    },
+    {
+        .name = "Clips on PLAY", .priv = &cfg_clips, .max = 1,
+        .choices = CHOICES("OFF", "ON"),
+        .help = "With RAW on, PLAY shows Mothlight's clip list first (length, size, delete).",
+        .help2 = "OFF: PLAY goes straight into ML's player, as before.",
     },
     { .name = "About Mothlight", .update = about_update, .icon_type = IT_ALWAYS_ON },
 };
@@ -2042,11 +2548,13 @@ static unsigned int moth_init(void)
         ui_text_set_font(i, (const struct ui_rbf *)font_dynamic[i].bitmap);
     load_profiles();
     bpp_from_config();
+    if (welcome_marker_exists()) cfg_welcomed = 1;
     /* a damaged config must not reach ML's menu as an out-of-range choice */
     if (cfg_theme < 0 || cfg_theme >= THEME_COUNT) cfg_theme = THEME_MOTHLIGHT;
     if (cfg_key < 0 || cfg_key > 2) cfg_key = 1;
     if (cfg_motion < 0 || cfg_motion > 1) cfg_motion = 1;
-    if (cfg_focus < 0 || cfg_focus > 1) cfg_focus = 1;
+    if (cfg_focus < 0 || cfg_focus > 2) cfg_focus = FOCUS_BOX;
+    if (cfg_clips < 0 || cfg_clips > 1) cfg_clips = 1;
     if (cfg_tally < 0 || cfg_tally > 2) cfg_tally = 1;
     if (cfg_card < 0 || cfg_card >= (int)COUNT(card_mb)) cfg_card = 0;
     menu_add("Mothlight", moth_menu, COUNT(moth_menu));
